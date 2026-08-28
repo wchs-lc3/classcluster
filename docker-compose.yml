@@ -40,8 +40,14 @@ services:
     mem_limit: 768m
     pids_limit: 512
     # Job directories are throwaway and must never touch the SD card.
+    # No explicit size= here: balenaOS's newer core-next supervisor rejects
+    # that option outright ("unsupported option `size`") and gets stuck
+    # retrying the same broken target release forever, which starves every
+    # other supervisor operation (including host-config changes) of the
+    # locks it needs. mem_limit above still bounds total container memory,
+    # tmpfs included.
     tmpfs:
-      - /run/lc3-jobs:size=384m,mode=0700
+      - /run/lc3-jobs:mode=0700
 
   cdn:
     build:

@@ -84,6 +84,22 @@ restarts the service. Nothing here needs a rebuild.
 | `LC3_CDN_GATE` | `1` | Hold the heartbeat until this device's asset mirror is complete. Set `0` to join the pool immediately (students may hit 404s). |
 | `LC3_RUNNER_CDN_PORT` | `80` | The asset port reported to the gateway. Must match `LC3_CDN_PORT`. |
 
+### Teacher shell (`runner`)
+
+A teacher can open a real login shell on a device from the Workers section of
+the admin view. It does not exist until `LC3_SHELL_TOKEN` is set here and to the
+same value on the gateway; without it the device serves no shell endpoint and
+the admin view shows the shell as unavailable. The shell runs as the container's
+own user, so it is root inside the container and sees the container's
+filesystem, not the host's.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `LC3_SHELL_TOKEN` | *(empty)* | Shared secret with the gateway. Empty means no shell on this device. |
+| `LC3_SHELL` | `/bin/bash` | The shell to start. |
+| `LC3_MAX_SHELLS` | `2` | Shells open at once on this device. |
+| `LC3_SHELL_IDLE_SEC` | `1800` | Close a shell nobody has read from for this long, so a closed browser tab does not leave one running. |
+
 ### Capacity (`runner`)
 
 | Variable | Default | Meaning |

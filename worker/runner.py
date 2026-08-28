@@ -18,10 +18,16 @@ is read back.
 """
 
 import base64
+import fcntl
+import hmac
 import json
 import os
+import pty
 import shutil
+import signal
+import struct
 import subprocess
+import termios
 import threading
 import time
 import uuid
@@ -92,7 +98,16 @@ except ValueError:
     ULIMIT_AS_MULT = 2.0
 ULIMIT_FSIZE_KB = env_int("LC3_ULIMIT_FSIZE_KB", 131072)
 
-_grade_lock = threading.Semaphore(max(1, env_int("LC3_GRADE_CONCURRENCY", 2)))
+GRADE_MAX = max(1, env_int("LC3_GRADE_CONCURRENCY", 2))
+_grade_lock = threading.Semaphore(GRADE_MAX)
+
+# The teacher's worker shell is off unless a token is configured, and the token
+# is the only thing standing between the runner's port and a root shell on this
+# node. See shell_start().
+SHELL_TOKEN = env_str("LC3_SHELL_TOKEN", "")
+SHELL_CMD = env_str("LC3_SHELL", "/bin/bash")
+SHELL_MAX = max(1, env_int("LC3_MAX_SHELLS", 2))
+SHELL_IDLE_SEC = max(60, env_int("LC3_SHELL_IDLE_SEC", 1800))
 
 
 def have_systemd_run():
@@ -389,6 +404,16 @@ _run_sem = threading.Semaphore(RUN_MAX)
 _sessions = {}
 _sessions_lock = threading.Lock()
 
+# Live occupancy, reported by /health so the teacher can see which node is busy.
+# A semaphore does not expose its own count, so track it alongside.
+_busy = {"runs": 0, "grades": 0, "shells": 0}
+_busy_lock = threading.Lock()
+
+
+def busy_add(kind, d):
+    with _busy_lock:
+        _busy[kind] = max(0, _busy[kind] + d)
+
 
 class RunSession:
     def __init__(self, job_dir, proc):
@@ -433,6 +458,7 @@ def _reader(sess, sid):
         pass
     sess.finish(sess.proc.returncode if sess.proc.returncode is not None else 0)
     _run_sem.release()
+    busy_add("runs", -1)
     shutil.rmtree(sess.job_dir, ignore_errors=True)
 
     def _cleanup():
@@ -465,6 +491,7 @@ def exec_start(payload):
     entry = payload.get("entry", "")
     if not _run_sem.acquire(timeout=15):
         return {"status": "busy"}
+    busy_add("runs", 1)
     os.makedirs(JOBS_DIR, exist_ok=True)
     job_dir = os.path.join(JOBS_DIR, "run-" + uuid.uuid4().hex[:12])
     os.makedirs(job_dir)
@@ -474,6 +501,7 @@ def exec_start(payload):
             ok, out = exec_compile_java(job_dir)
             if not ok:
                 _run_sem.release()
+                busy_add("runs", -1)
                 shutil.rmtree(job_dir, ignore_errors=True)
                 return {"status": "compile_error", "output": out}
             main_class = entry[:-5] if entry.endswith(".java") else entry
@@ -494,6 +522,7 @@ def exec_start(payload):
         return {"status": "running", "session": sid}
     except Exception as e:
         _run_sem.release()
+        busy_add("runs", -1)
         shutil.rmtree(job_dir, ignore_errors=True)
         return {"status": "error", "output": type(e).__name__}
 
@@ -537,6 +566,242 @@ def exec_kill(payload):
     return {"ok": True}
 
 
+# ------------------------------ worker shell -------------------------------
+# A real login shell on this node, for the teacher to inspect a worker that is
+# misbehaving. It is deliberately NOT sandboxed -- a shell that cannot see the
+# host filesystem or the service logs would not answer the question the teacher
+# opened it to answer -- so it runs with the runner's own privileges, which on a
+# provisioned worker means root.
+#
+# Two things keep that from being a hole. The endpoints do not exist unless
+# LC3_SHELL_TOKEN is set on this node, and every request must carry that token.
+# The gateway holds the token and only ever forwards a request for a signed-in
+# teacher, so the runner port alone grants nothing.
+
+_shells = {}
+_shells_lock = threading.Lock()
+
+
+class ShellSession:
+    def __init__(self, proc, fd):
+        self.proc = proc
+        self.fd = fd
+        self.buf = bytearray()
+        # Offsets the terminal sends back are positions in the whole stream, not
+        # into buf, because buf is a sliding window. base is how much has been
+        # dropped off the front, and is what keeps the two in step.
+        self.base = 0
+        self.done = False
+        self.exit = 0
+        self.touched = time.time()
+        self.cond = threading.Condition()
+
+    def append(self, b):
+        with self.cond:
+            self.buf.extend(b)
+            # A long-lived shell would otherwise grow without bound; keep the
+            # tail, which is what a reconnecting terminal can still use.
+            if len(self.buf) > (1 << 20):
+                drop = len(self.buf) - (1 << 19)
+                del self.buf[:drop]
+                self.base += drop
+            self.cond.notify_all()
+
+    def finish(self, code):
+        with self.cond:
+            self.done = True
+            self.exit = code
+            self.cond.notify_all()
+
+    def read(self, since, max_wait):
+        with self.cond:
+            end = self.base + len(self.buf)
+            if since >= end and not self.done:
+                self.cond.wait(timeout=max_wait)
+                end = self.base + len(self.buf)
+            # A terminal that fell behind a trim resumes at the oldest byte
+            # still held rather than replaying from a position that is gone.
+            start = min(max(since, self.base), end)
+            return bytes(self.buf[start - self.base:]), end, self.done, self.exit
+
+
+def shell_enabled():
+    return bool(SHELL_TOKEN)
+
+
+def shell_authed(payload):
+    tok = payload.get("token", "")
+    return isinstance(tok, str) and hmac.compare_digest(tok, SHELL_TOKEN)
+
+
+def _shell_reader(sess, sid):
+    try:
+        while True:
+            try:
+                chunk = os.read(sess.fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            sess.append(chunk)
+    finally:
+        try:
+            sess.proc.wait(timeout=5)
+        except Exception:
+            pass
+        sess.finish(sess.proc.returncode if sess.proc.returncode is not None else 0)
+        try:
+            os.close(sess.fd)
+        except OSError:
+            pass
+        busy_add("shells", -1)
+
+        def _cleanup():
+            time.sleep(60)
+            with _shells_lock:
+                _shells.pop(sid, None)
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+
+def _shell_reaper():
+    """Close shells nobody is reading any more: a teacher who closes the browser
+    tab never sends a kill, and an orphaned root shell should not outlive them."""
+    while True:
+        time.sleep(30)
+        now = time.time()
+        with _shells_lock:
+            stale = [s for s in _shells.values()
+                     if not s.done and now - s.touched > SHELL_IDLE_SEC]
+        for s in stale:
+            try:
+                os.killpg(os.getpgid(s.proc.pid), signal.SIGHUP)
+            except Exception:
+                pass
+
+
+def set_winsize(fd, rows, cols):
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0))
+    except OSError:
+        pass
+
+
+def shell_start(payload):
+    with _busy_lock:
+        if _busy["shells"] >= SHELL_MAX:
+            return {"status": "busy"}
+        _busy["shells"] += 1
+    try:
+        master, slave = pty.openpty()
+        set_winsize(master, int(payload.get("rows", 24) or 24),
+                    int(payload.get("cols", 80) or 80))
+        env = dict(os.environ)
+        env["TERM"] = "xterm-256color"
+        env["LC3_WORKER_SHELL"] = "1"
+        proc = subprocess.Popen(
+            [SHELL_CMD, "-i"], stdin=slave, stdout=slave, stderr=slave,
+            start_new_session=True, close_fds=True, env=env, cwd="/")
+        os.close(slave)
+        sess = ShellSession(proc, master)
+        sid = uuid.uuid4().hex[:16]
+        with _shells_lock:
+            _shells[sid] = sess
+        threading.Thread(target=_shell_reader, args=(sess, sid), daemon=True).start()
+        return {"status": "running", "session": sid}
+    except Exception as e:
+        busy_add("shells", -1)
+        return {"status": "error", "output": type(e).__name__}
+
+
+def _shell_get(payload):
+    with _shells_lock:
+        return _shells.get(payload.get("session", ""))
+
+
+def shell_output(payload):
+    since = int(payload.get("since", 0) or 0)
+    sess = _shell_get(payload)
+    if sess is None:
+        return {"data": "", "next": since, "done": True, "exit": 0}
+    sess.touched = time.time()
+    data, nxt, done, code = sess.read(since, 25)
+    return {"data": base64.b64encode(data).decode(), "next": nxt,
+            "done": done, "exit": code}
+
+
+def shell_input(payload):
+    sess = _shell_get(payload)
+    if sess is None:
+        return {"ok": False}
+    sess.touched = time.time()
+    try:
+        os.write(sess.fd, base64.b64decode(payload.get("data", "")))
+    except Exception:
+        return {"ok": False}
+    return {"ok": True}
+
+
+def shell_resize(payload):
+    sess = _shell_get(payload)
+    if sess is None:
+        return {"ok": False}
+    set_winsize(sess.fd, int(payload.get("rows", 24) or 24),
+                int(payload.get("cols", 80) or 80))
+    return {"ok": True}
+
+
+def shell_kill(payload):
+    sess = _shell_get(payload)
+    if sess is not None:
+        try:
+            os.killpg(os.getpgid(sess.proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+# ------------------------------- load report -------------------------------
+
+def _loadavg():
+    try:
+        return [round(x, 2) for x in os.getloadavg()]
+    except OSError:
+        return [0.0, 0.0, 0.0]
+
+
+def _mem():
+    total = avail = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal"):
+                    total = int(line.split()[1]) // 1024
+                elif line.startswith("MemAvailable"):
+                    avail = int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return total, avail
+
+
+def health():
+    with _busy_lock:
+        runs, grades, shells = _busy["runs"], _busy["grades"], _busy["shells"]
+    total, avail = _mem()
+    load = _loadavg()
+    return {
+        "ok": True,
+        "runs": runs, "max_runs": RUN_MAX,
+        "grades": grades, "max_grades": GRADE_MAX,
+        "shells": shells,
+        "loadavg": load,
+        "cpus": os.cpu_count() or 1,
+        "mem_total_mb": total, "mem_avail_mb": avail,
+        "shell_available": shell_enabled(),
+        "java": bool(shutil.which("javac")),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -551,7 +816,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, {"ok": True})
+            self._send(200, health())
         else:
             self._send(404, {"error": "not found"})
 
@@ -560,7 +825,17 @@ class Handler(BaseHTTPRequestHandler):
             "/exec/start": exec_start, "/exec/output": exec_output,
             "/exec/input": exec_input, "/exec/kill": exec_kill,
         }
-        if self.path not in ("/grade", "/compile") and self.path not in exec_paths:
+        shell_paths = {
+            "/shell/start": shell_start, "/shell/output": shell_output,
+            "/shell/input": shell_input, "/shell/resize": shell_resize,
+            "/shell/kill": shell_kill,
+        }
+        known = self.path in ("/grade", "/compile") or self.path in exec_paths
+        # With no token configured this node has no shell, and says so the same
+        # way it would for any path it does not serve.
+        if self.path in shell_paths and shell_enabled():
+            known = True
+        if not known:
             self._send(404, {"error": "not found"})
             return
         try:
@@ -571,6 +846,17 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode())
         except Exception:
             self._send(400, {"error": "bad json"})
+            return
+
+        if self.path in shell_paths:
+            if not shell_authed(payload):
+                self._send(403, {"error": "forbidden"})
+                return
+            try:
+                result = shell_paths[self.path](payload)
+            except Exception as e:
+                result = {"status": "error", "note": type(e).__name__}
+            self._send(200, result)
             return
 
         # Interactive endpoints have their own concurrency control and must not
@@ -584,6 +870,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         with _grade_lock:
+            busy_add("grades", 1)
             try:
                 if self.path == "/compile":
                     result = compile_java(payload)
@@ -591,6 +878,8 @@ class Handler(BaseHTTPRequestHandler):
                     result = grade(payload)
             except Exception as e:
                 result = {"status": "error", "tests": [], "note": type(e).__name__}
+            finally:
+                busy_add("grades", -1)
         self._send(200, result)
 
 
@@ -681,13 +970,16 @@ def _preflight():
               % probe.stderr.decode("utf-8", "replace").strip(), flush=True)
         print("[lc3] in a container the service needs privileged: true", flush=True)
         raise SystemExit(1)
-    print("[lc3] runner on %s:%d | job limits: %s | max runs: %d | java: %s"
+    print("[lc3] runner on %s:%d | job limits: %s | max runs: %d | java: %s | shell: %s"
           % (BIND, PORT, "systemd cgroups" if USE_SYSTEMD_RUN else "container rlimits",
-             RUN_MAX, shutil.which("javac") or "missing"), flush=True)
+             RUN_MAX, shutil.which("javac") or "missing",
+             "on" if shell_enabled() else "off"), flush=True)
 
 
 if __name__ == "__main__":
     _preflight()
     os.makedirs(JOBS_DIR, exist_ok=True)
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    if shell_enabled():
+        threading.Thread(target=_shell_reaper, daemon=True).start()
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

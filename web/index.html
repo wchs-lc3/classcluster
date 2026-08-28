@@ -31,6 +31,18 @@
     #lc3-gate .err { color: #f14c4c; font-size: 12px; min-height: 16px; margin-top: 12px; text-align: center; }
     #lc3-gate .loading { color: #9a9a9a; font-size: 14px; }
 
+    #lc3-credit {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 21;
+      padding: 12px 16px; text-align: center; pointer-events: none;
+      font-family: -apple-system, Segoe UI, Ubuntu, Roboto, sans-serif;
+      font-size: 12px; color: #8a8a8a;
+    }
+    #lc3-credit .ver {
+      display: block; margin-top: 4px; font-size: 10px; color: #5a5a5a;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      word-break: break-all;
+    }
+
     /* Trim the activity bar to what the classroom needs: keep Explorer, the
        teacher's Class Management view, and settings; hide the rest. */
     .activitybar .action-item:has([aria-label^="Search"]),
@@ -42,11 +54,13 @@
 </head>
 <body aria-label="">
   <div id="lc3-gate"><div class="loading">Loading LC3...</div></div>
+  <div id="lc3-credit">By MrFizz and JL681<span class="ver">v135.2537.5328-b2026.08.28-sha384DUauvevwvyuvNDXIEwbcbeyuwve</span></div>
 
 <script>
 (function () {
   'use strict';
   const gate = document.getElementById('lc3-gate');
+  const credit = document.getElementById('lc3-credit');
 
   function showLogin(message) {
     gate.innerHTML =
@@ -160,6 +174,7 @@
     await load(base + '/out/vs/workbench/workbench.web.main.js');
     await load(base + '/out/vs/code/browser/workbench/workbench.js');
     gate.remove();
+    credit.remove(); // the editor owns the whole viewport once it is up
   }
 
   async function start(me) {

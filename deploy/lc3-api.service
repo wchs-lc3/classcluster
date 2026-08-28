@@ -7,6 +7,9 @@ ExecStart=/opt/lc3/bin/lc3d
 Restart=always
 RestartSec=3
 Environment=LC3_DATA=/srv/lc3
+# Uncomment, with the same value on every node you want reachable, to let a
+# teacher open a shell on a worker. Unset means the feature does not exist.
+#Environment=LC3_SHELL_TOKEN=
 
 [Install]
 WantedBy=multi-user.target

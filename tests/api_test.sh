@@ -247,6 +247,41 @@ has "$dl" 'hello-java' "moving demo to the java class adds the java assignment"
 echo "$dl" | grep -q 'hello-py' && bad "old python assignment still present after class switch" || ok "and removes the python assignment"
 tpost /api/admin/students/setclass '{"username":"demo","class":"cp3"}' >/dev/null
 
+echo "== teacher: worker load report =="
+wl=$(curl -s -b $JT $BASE/api/admin/workers)
+has "$wl" '"load"' "workers carry a load report"
+has "$wl" '"max_runs"' "load report says how many runs a node accepts"
+has "$wl" '"loadavg"' "load report carries the machine's own load"
+
+echo "== teacher: assignment template, then Submit as a rehearsal =="
+tpost /api/admin/assignments/delete '{"id":"tmplpy"}' >/dev/null 2>&1
+curl -s -b $JT -X POST "$BASE/api/fs/delete?path=/tmplpy" >/dev/null 2>&1
+has "$(tpost /api/admin/assignments/template '{"folder":"tmplpy","language":"python","title":"Template"}')" '"ok":true' "template creates an assignment folder"
+tl=$(curl -s -b $JT "$BASE/api/fs/list?path=/tmplpy")
+has "$tl" 'starter' "template has a starter/ students receive"
+has "$tl" 'tests' "template has private tests/"
+has "$tl" 'solution' "template has a worked answer to check the tests"
+# Submit before the assignment is published: the teacher's own folder describes
+# it, and the unfinished starter must not pass everything.
+res=$(tpost /api/submit '{"assignment":"tmplpy"}')
+has "$res" '"dry_run":true' "a teacher's Submit is a rehearsal, not a grade"
+has "$res" '"tests"' "the unpublished template grades through the real path"
+echo "$res" | grep -q '"failed":0' && bad "the unfinished starter passed everything" || ok "the unfinished starter fails, as a student's would"
+# Now with the worked answer in place, everything passes.
+sol=$(curl -s -b $JT "$BASE/api/fs/read?path=/tmplpy/solution/main.py")
+curl -s -b $JT -X POST --data-binary "$sol" "$BASE/api/fs/write?path=/tmplpy/starter/main.py" >/dev/null
+has "$(tpost /api/submit '{"assignment":"tmplpy"}')" '"failed":0' "the template's worked answer passes its own tests"
+subs=$(curl -s -b $JT $BASE/api/admin/submissions)
+echo "$subs" | grep -q 'tmplpy' && bad "a teacher's rehearsal was recorded as a submission" || ok "a rehearsal leaves no submission behind"
+
+echo "== teacher shell: who may open one =="
+chk "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -d '{"host":"127.0.0.1"}' $BASE/api/admin/shell/start)" "401" "shell refused when not logged in"
+chk "$(curl -s -o /dev/null -w '%{http_code}' -b $J -X POST -H 'Content-Type: application/json' \
+  -d '{"host":"127.0.0.1"}' $BASE/api/admin/shell/start)" "403" "shell refused to a student"
+chk "$(curl -s -o /dev/null -w '%{http_code}' -b $JT -X POST -H 'Content-Type: application/json' \
+  -d '{"host":"203.0.113.7"}' $BASE/api/admin/shell/start)" "404" "shell refused for a host that is not a worker"
+
 echo
 echo "==== $pass passed, $fail failed ===="
 [ $fail -eq 0 ]

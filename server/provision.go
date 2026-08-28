@@ -44,7 +44,14 @@ http {
 
 // runnerUnitFor builds the worker's runner service with the heartbeat settings
 // so it reports in to the gateway under a stable id (and its IP can change).
+// The shell token is carried over from the gateway when it has one, so a worker
+// the teacher just added is reachable from the admin view without an SSH visit;
+// with no token on the gateway the worker gets no shell either.
 func runnerUnitFor(gatewayIP, workerID, token string) string {
+	shell := ""
+	if t := shellToken(); t != "" {
+		shell = "Environment=LC3_SHELL_TOKEN=" + t + "\n"
+	}
 	return `[Unit]
 Description=LC3 grading runner
 After=network.target
@@ -58,7 +65,7 @@ Environment=LC3_RUNNER_CDN_PORT=80
 Environment=LC3_GATEWAY=` + gatewayIP + `
 Environment=LC3_WORKER_ID=` + workerID + `
 Environment=LC3_WORKER_TOKEN=` + token + `
-
+` + shell + `
 [Install]
 WantedBy=multi-user.target
 `

@@ -58,6 +58,13 @@ ENV LC3_PYTHON="python"
 ENV LC3_SANDBOX_PATH="/usr/bin:/usr/lib/jvm/default/bin"
 ENV LC3_SANDBOX_ROBINDS=""
 
+# --- teacher shell ---
+# LC3_SHELL_TOKEN has no default for the same reason as LC3_WORKER_TOKEN, and
+# because its absence is what keeps the shell endpoints from existing at all.
+ENV LC3_SHELL="/bin/bash"
+ENV LC3_MAX_SHELLS="2"
+ENV LC3_SHELL_IDLE_SEC="1800"
+
 # --- capacity ---
 ENV LC3_MAX_RUNS=""
 ENV LC3_GRADE_CONCURRENCY="2"

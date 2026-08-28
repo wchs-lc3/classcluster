@@ -103,6 +103,11 @@ func safePath(root, rel string) (string, error) {
 	return p, nil
 }
 
+func isDir(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
+}
+
 func validID(s string) bool {
 	if s == "" || strings.HasPrefix(s, ".") {
 		return false
@@ -553,25 +558,49 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "bad assignment id")
 		return
 	}
+	dryRun := u.Role == "teacher"
 	m := loadManifest(aid)
+	own := filepath.Join(studentRoot(u), aid)
+	if m == nil && dryRun {
+		// An assignment the teacher is still writing has no published manifest
+		// yet. Its own folder describes it well enough to rehearse against, so
+		// Submit works from the first template right through to publishing.
+		m = authoringManifest(own)
+	}
 	if m == nil {
 		fail(w, 404, "unknown assignment")
 		return
 	}
-	studentFolder := filepath.Join(studentRoot(u), aid)
-	if st, err := os.Stat(studentFolder); err != nil || !st.IsDir() {
+
+	workFolder := filepath.Join(studentRoot(u), aid)
+	testsFolder := filepath.Join(assignDir(), aid, "tests")
+	if dryRun {
+		// A teacher owns the authoring layout (<id>/starter + <id>/tests), not a
+		// student's flat copy, so Submit grades exactly the pair a student would
+		// be graded on: the starter they receive, against the tests that run.
+		// Their working copies win over the published ones, which is what makes
+		// Submit a usable check before publishing an edit.
+		if isDir(filepath.Join(own, "starter")) {
+			workFolder = filepath.Join(own, "starter")
+		} else if !isDir(own) {
+			workFolder = filepath.Join(assignDir(), aid, "starter")
+		}
+		if isDir(filepath.Join(own, "tests")) {
+			testsFolder = filepath.Join(own, "tests")
+		}
+	}
+	if !isDir(workFolder) {
 		fail(w, 404, "no work folder for this assignment")
 		return
 	}
-	testsFolder := filepath.Join(assignDir(), aid, "tests")
-	if st, err := os.Stat(testsFolder); err != nil || !st.IsDir() {
+	if !isDir(testsFolder) {
 		fail(w, 500, "assignment has no tests")
 		return
 	}
 
 	payload := map[string]any{
 		"language":    m.Language,
-		"files":       collectFiles(studentFolder, 512<<10, 8<<20),
+		"files":       collectFiles(workFolder, 512<<10, 8<<20),
 		"tests":       collectFiles(testsFolder, 512<<10, 8<<20),
 		"timeout_sec": m.TimeoutSec,
 		"mem_mb":      m.MemMB,
@@ -604,15 +633,19 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 			passed++
 		}
 	}
-	sub := &Submission{
-		Username: u.Username, Assignment: aid, Ts: time.Now().Unix(),
-		Status: result.Status, Passed: passed, Failed: len(tests) - passed,
-		Tests: tests,
+	// A teacher's Submit is a rehearsal of the student's, so it is not recorded
+	// as a grade and does not show up among the class's submissions.
+	id := 0
+	if !dryRun {
+		id = store.AddSubmission(&Submission{
+			Username: u.Username, Assignment: aid, Ts: time.Now().Unix(),
+			Status: result.Status, Passed: passed, Failed: len(tests) - passed,
+			Tests: tests,
+		})
 	}
-	id := store.AddSubmission(sub)
 	writeJSON(w, 200, map[string]any{
 		"id": id, "status": result.Status, "passed": passed,
-		"failed": len(tests) - passed, "tests": tests})
+		"failed": len(tests) - passed, "tests": tests, "dry_run": dryRun})
 }
 
 func handleCompileJava(w http.ResponseWriter, r *http.Request) {
@@ -1639,7 +1672,42 @@ func handleAdminWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	ws := store.AllWorkers()
 	sort.Slice(ws, func(i, j int) bool { return ws[i].Host < ws[j].Host })
-	writeJSON(w, 200, map[string]any{"workers": ws})
+
+	// Ask every node what it is currently carrying. The polls run together so
+	// one unreachable worker does not hold up the whole view.
+	type row struct {
+		Worker
+		Load WorkerLoad `json:"load"`
+	}
+	rows := make([]row, len(ws))
+	var wg sync.WaitGroup
+	for i, wk := range ws {
+		rows[i].Worker = wk
+		if wk.Status == "provisioning" {
+			continue
+		}
+		port := wk.RunnerPort
+		if port == 0 {
+			port = 9500
+		}
+		wg.Add(1)
+		go func(i int, ref runnerRef) {
+			defer wg.Done()
+			rows[i].Load = fetchWorkerLoad(ref)
+		}(i, runnerRef{wk.Host, port})
+	}
+	wg.Wait()
+
+	runLoadMu.Lock()
+	inflightMu.Lock()
+	for i := range rows {
+		rows[i].Load.Dispatched = runLoad[rows[i].Host]
+		rows[i].Load.Grading = inflight[rows[i].Host]
+	}
+	inflightMu.Unlock()
+	runLoadMu.Unlock()
+
+	writeJSON(w, 200, map[string]any{"workers": rows, "shell": shellToken() != ""})
 }
 
 func handleAdminAddWorker(w http.ResponseWriter, r *http.Request) {
@@ -1779,6 +1847,7 @@ func main() {
 	mux.HandleFunc("POST /api/admin/classes/delete", handleAdminDelClass)
 	mux.HandleFunc("POST /api/admin/assignments/upload", handleAdminUploadAssignment)
 	mux.HandleFunc("POST /api/admin/assignments/from-folder", handleAdminAssignmentFromFolder)
+	mux.HandleFunc("POST /api/admin/assignments/template", handleAdminAssignmentTemplate)
 	mux.HandleFunc("POST /api/admin/assignments/delete", handleAdminDeleteAssignment)
 	mux.HandleFunc("POST /api/admin/assignments/publish", handleAdminPublish)
 	mux.HandleFunc("POST /api/admin/assignments/unpublish", handleAdminUnpublish)
@@ -1791,6 +1860,11 @@ func main() {
 	mux.HandleFunc("POST /api/admin/workers", handleAdminAddWorker)
 	mux.HandleFunc("POST /api/admin/workers/delete", handleAdminDelWorker)
 	mux.HandleFunc("POST /api/admin/workers/recheck", handleAdminRecheck)
+	mux.HandleFunc("POST /api/admin/shell/start", handleAdminShellStart)
+	mux.HandleFunc("GET /api/admin/shell/output", handleAdminShellOutput)
+	mux.HandleFunc("POST /api/admin/shell/input", handleAdminShellInput)
+	mux.HandleFunc("POST /api/admin/shell/resize", handleAdminShellResize)
+	mux.HandleFunc("POST /api/admin/shell/kill", handleAdminShellKill)
 	mux.HandleFunc("POST /api/worker/heartbeat", handleWorkerHeartbeat)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))

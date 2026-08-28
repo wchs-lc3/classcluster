@@ -1,5 +1,6 @@
 #!/bin/bash
 # TEMPORARY DEBUG SIDECAR — not for production use.
+# (build marker: force image change so env-var-only updates actually restart this container)
 #
 # Runs a tiny sshd, then dials a reverse tunnel out through egress-proxy's
 # local SOCKS5 port to the VPN box, forwarding <VPN box>:12222 back to this

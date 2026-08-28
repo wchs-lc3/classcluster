@@ -1,0 +1,12 @@
+[Unit]
+Description=LC3 grading runner (local fallback)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python /opt/lc3/worker/runner.py
+Restart=always
+RestartSec=3
+Environment=LC3_RUNNER_BIND=127.0.0.1
+
+[Install]
+WantedBy=multi-user.target

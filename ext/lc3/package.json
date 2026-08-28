@@ -1,0 +1,81 @@
+{
+  "name": "lc3",
+  "displayName": "LC3 Classroom",
+  "description": "Run in the integrated terminal, grade against private tests, manage classes.",
+  "version": "2.0.0",
+  "publisher": "lc3",
+  "engines": { "vscode": "^1.85.0" },
+  "browser": "./extension.js",
+  "activationEvents": ["onFileSystem:lc3", "onStartupFinished"],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "lc3", "title": "Class Management", "icon": "$(mortar-board)" }
+      ]
+    },
+    "views": {
+      "lc3": [
+        { "id": "lc3.admin", "name": "Class Management", "when": "lc3.isTeacher" }
+      ]
+    },
+    "commands": [
+      { "command": "lc3.run", "title": "Run Program", "category": "LC3", "icon": "$(play)" },
+      { "command": "lc3.submit", "title": "Submit for Grading", "category": "LC3", "icon": "$(rocket)" },
+      { "command": "lc3.format", "title": "Format Code", "category": "LC3", "icon": "$(list-flat)" },
+      { "command": "lc3.refresh", "title": "Refresh Files", "category": "LC3", "icon": "$(refresh)" },
+      { "command": "lc3.logout", "title": "Log Out", "category": "LC3" },
+      { "command": "lc3.changePassword", "title": "Change Password", "category": "LC3", "icon": "$(key)" },
+      { "command": "lc3.admin.refresh", "title": "Refresh", "category": "LC3", "icon": "$(refresh)" },
+      { "command": "lc3.addClass", "title": "Add Class", "category": "LC3", "icon": "$(add)" },
+      { "command": "lc3.deleteClass", "title": "Delete Class", "category": "LC3", "icon": "$(trash)" },
+      { "command": "lc3.addStudent", "title": "Add Student", "category": "LC3", "icon": "$(add)" },
+      { "command": "lc3.addStudents", "title": "Add Students (bulk)", "category": "LC3", "icon": "$(person-add)" },
+      { "command": "lc3.setStudentClass", "title": "Set Class", "category": "LC3", "icon": "$(edit)" },
+      { "command": "lc3.deleteStudent", "title": "Delete Student", "category": "LC3", "icon": "$(trash)" },
+      { "command": "lc3.resetPassword", "title": "Reset Password", "category": "LC3", "icon": "$(key)" },
+      { "command": "lc3.createAssignment", "title": "Create Assignment from Folder", "category": "LC3", "icon": "$(new-folder)" },
+      { "command": "lc3.deleteAssignment", "title": "Delete Assignment", "category": "LC3", "icon": "$(trash)" },
+      { "command": "lc3.uploadAssignment", "title": "Upload Assignment Zip", "category": "LC3", "icon": "$(cloud-upload)" },
+      { "command": "lc3.publishAssignment", "title": "Publish", "category": "LC3", "icon": "$(broadcast)" },
+      { "command": "lc3.unpublishAssignment", "title": "Unpublish", "category": "LC3", "icon": "$(eye-closed)" },
+      { "command": "lc3.recallAssignment", "title": "Recall Submissions", "category": "LC3", "icon": "$(cloud-download)" },
+      { "command": "lc3.gradeAssignment", "title": "Grade Submissions", "category": "LC3", "icon": "$(checklist)" },
+      { "command": "lc3.addWorker", "title": "Add Worker", "category": "LC3", "icon": "$(add)" },
+      { "command": "lc3.recheckWorkers", "title": "Recheck Workers", "category": "LC3", "icon": "$(sync)" },
+      { "command": "lc3.deleteWorker", "title": "Remove Worker", "category": "LC3", "icon": "$(trash)" }
+    ],
+    "menus": {
+      "editor/title": [
+        { "command": "lc3.run", "group": "navigation@1", "when": "resourceExtname == .py || resourceExtname == .java" },
+        { "command": "lc3.submit", "group": "navigation@2", "when": "resourceScheme == lc3" },
+        { "command": "lc3.format", "group": "navigation@3", "when": "resourceExtname == .py || resourceExtname == .java" }
+      ],
+      "view/title": [
+        { "command": "lc3.admin.refresh", "when": "view == lc3.admin", "group": "navigation" }
+      ],
+      "view/item/context": [
+        { "command": "lc3.addClass", "when": "view == lc3.admin && viewItem == sec:classes", "group": "inline" },
+        { "command": "lc3.addStudent", "when": "view == lc3.admin && viewItem == sec:students", "group": "inline" },
+        { "command": "lc3.addStudents", "when": "view == lc3.admin && viewItem == sec:students", "group": "inline" },
+        { "command": "lc3.createAssignment", "when": "view == lc3.admin && viewItem == sec:assignments", "group": "inline" },
+        { "command": "lc3.uploadAssignment", "when": "view == lc3.admin && viewItem == sec:assignments", "group": "inline" },
+        { "command": "lc3.addWorker", "when": "view == lc3.admin && viewItem == sec:workers", "group": "inline" },
+        { "command": "lc3.recheckWorkers", "when": "view == lc3.admin && viewItem == sec:workers", "group": "inline" },
+        { "command": "lc3.deleteClass", "when": "view == lc3.admin && viewItem == class", "group": "inline" },
+        { "command": "lc3.setStudentClass", "when": "view == lc3.admin && viewItem == student", "group": "inline" },
+        { "command": "lc3.resetPassword", "when": "view == lc3.admin && viewItem == student", "group": "inline" },
+        { "command": "lc3.deleteStudent", "when": "view == lc3.admin && viewItem == student", "group": "inline" },
+        { "command": "lc3.gradeAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
+        { "command": "lc3.recallAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
+        { "command": "lc3.publishAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
+        { "command": "lc3.unpublishAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
+        { "command": "lc3.deleteAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
+        { "command": "lc3.deleteWorker", "when": "view == lc3.admin && viewItem == worker", "group": "inline" }
+      ]
+    },
+    "keybindings": [
+      { "command": "lc3.run", "key": "f5", "when": "editorTextFocus" },
+      { "command": "lc3.run", "key": "ctrl+enter", "when": "editorTextFocus" }
+    ]
+  }
+}

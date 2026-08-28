@@ -1,0 +1,16 @@
+name: lc3-worker
+type: sw.application
+description: >-
+  LC3 classroom cluster worker: sandboxed Java/Python grading and interactive
+  runs, plus a mirror of the gateway's heavy browser runtimes.
+joinable: true
+post-provisioning: >-
+  Set two variables on the fleet before the device can join the cluster:
+
+  * `LC3_GATEWAY` - the LC3 gateway's IP or hostname on the LAN.
+  * `LC3_WORKER_TOKEN` - the shared secret, `/srv/lc3/state/worker_token` on
+    the gateway.
+
+  The device registers itself on its next heartbeat; no SSH provisioning and
+  no entry in the teacher's admin view are needed. See balena/README.md for
+  every other variable.

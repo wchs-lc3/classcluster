@@ -1,0 +1,12 @@
+# The worker images need worker/, vendor/junit.jar, vendor/hamcrest.jar and
+# balena/. Everything else is gateway-side and only slows the build up.
+.git
+server/
+web/
+ext/
+tests/
+examples/
+deploy/
+docs/
+vendor/vscode-web.tgz
+**/*.md

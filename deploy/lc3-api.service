@@ -1,0 +1,12 @@
+[Unit]
+Description=LC3 gateway API
+After=network.target
+
+[Service]
+ExecStart=/opt/lc3/bin/lc3d
+Restart=always
+RestartSec=3
+Environment=LC3_DATA=/srv/lc3
+
+[Install]
+WantedBy=multi-user.target

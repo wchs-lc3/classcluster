@@ -1,0 +1,77 @@
+# LC3 worker fleet for balenaOS (Raspberry Pi 3/4).
+#
+# Three services per device:
+#   runner       - grades submissions and hosts interactive runs (port 9500)
+#   cdn          - mirrors the gateway's heavy static assets and serves them (port 80)
+#   egress-proxy - optional SOCKS5 sidecar tunneling out through the trojan VPN box
+#
+# All three use host networking so the gateway sees the device's real LAN
+# address: it learns a worker's IP from the heartbeat connection, which is how
+# a DHCP address change is handled without touching the dashboard. It also
+# means egress-proxy's SOCKS5 port lives on the device's own loopback;
+# egress-proxy points balenaOS's own host proxy at itself via the local
+# Supervisor API once it's up, so balenaCloud's own connection routes
+# through the tunnel too, not just other containers' traffic.
+#
+# Every LC3_* setting is an image default (see balena/*/Dockerfile) so a fleet,
+# device, or service variable in the balenaCloud dashboard overrides it with no
+# rebuild. Only two must be set before a device is useful:
+#   LC3_GATEWAY       the gateway's IP or hostname, e.g. 192.168.1.146
+#   LC3_WORKER_TOKEN  contents of /srv/lc3/state/worker_token on the gateway
+#
+# egress-proxy is opt-in and idles until LC3_EGRESS_ENABLE=1; see
+# balena/README.md for its variables.
+version: '2.4'
+
+volumes:
+  cdn-assets:
+
+services:
+  runner:
+    build:
+      context: .
+      dockerfile: balena/worker/Dockerfile
+    restart: always
+    network_mode: host
+    # bwrap needs to unshare namespaces to sandbox student code at all.
+    privileged: true
+    # The outer cap that systemd's per-job cgroup used to provide. Raise
+    # mem_limit on a 2GB+ device; a 1GB Pi 3 should stay near this.
+    mem_limit: 768m
+    pids_limit: 512
+    # Job directories are throwaway and must never touch the SD card.
+    tmpfs:
+      - /run/lc3-jobs:size=384m,mode=0700
+
+  cdn:
+    build:
+      context: .
+      dockerfile: balena/cdn/Dockerfile
+    restart: always
+    network_mode: host
+    mem_limit: 192m
+    volumes:
+      - cdn-assets:/srv/lc3-cdn
+
+  egress-proxy:
+    build:
+      context: .
+      dockerfile: balena/egress-proxy/Dockerfile
+    restart: always
+    network_mode: host
+    mem_limit: 64m
+    # Needed so start.sh can PATCH the host proxy onto itself via the local
+    # Supervisor API once xray is listening — see start.sh for why this is
+    # done locally instead of from the balenaCloud dashboard/CLI.
+    labels:
+      io.balena.features.supervisor-api: '1'
+
+  # TEMPORARY, canary-only: verifies egress-proxy without depending on
+  # balenaCloud's own connectivity. See balena/debug-ssh-tunnel/start.sh.
+  debug-ssh-tunnel:
+    build:
+      context: .
+      dockerfile: balena/debug-ssh-tunnel/Dockerfile
+    restart: always
+    network_mode: host
+    mem_limit: 64m

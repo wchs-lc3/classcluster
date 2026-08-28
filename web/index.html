@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>LC3 Code</title>
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+  <link rel="icon" href="/ide/favicon.ico" type="image/x-icon" />
+  <link data-name="vs/workbench/workbench.web.main" rel="stylesheet" href="/ide/out/vs/workbench/workbench.web.main.css">
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #lc3-gate {
+      position: fixed; inset: 0; z-index: 20; display: flex;
+      align-items: center; justify-content: center;
+      background: #1e1e1e; color: #cccccc;
+      font-family: -apple-system, Segoe UI, Ubuntu, Roboto, sans-serif;
+    }
+    #lc3-gate .card { width: 300px; }
+    #lc3-gate h1 { font-size: 20px; font-weight: 600; margin: 0 0 24px; text-align: center; }
+    #lc3-gate label { display: block; font-size: 12px; color: #9a9a9a; margin: 14px 0 5px; }
+    #lc3-gate input {
+      width: 100%; box-sizing: border-box; font-size: 14px; padding: 8px 10px;
+      color: #e0e0e0; background: #2a2a2a; border: 1px solid #3c3c3c; border-radius: 4px;
+    }
+    #lc3-gate input:focus { outline: none; border-color: #0e639c; }
+    #lc3-gate button {
+      width: 100%; margin-top: 22px; font-size: 14px; padding: 9px;
+      color: #ffffff; background: #0e639c; border: 0; border-radius: 4px; cursor: pointer;
+    }
+    #lc3-gate button:hover { background: #1177bb; }
+    #lc3-gate .err { color: #f14c4c; font-size: 12px; min-height: 16px; margin-top: 12px; text-align: center; }
+    #lc3-gate .loading { color: #9a9a9a; font-size: 14px; }
+
+    /* Trim the activity bar to what the classroom needs: keep Explorer, the
+       teacher's Class Management view, and settings; hide the rest. */
+    .activitybar .action-item:has([aria-label^="Search"]),
+    .activitybar .action-item:has([aria-label^="Source Control"]),
+    .activitybar .action-item:has([aria-label^="Run and Debug"]),
+    .activitybar .action-item:has([aria-label^="Extensions"]),
+    .activitybar .action-item:has([aria-label^="Accounts"]) { display: none !important; }
+  </style>
+</head>
+<body aria-label="">
+  <div id="lc3-gate"><div class="loading">Loading LC3...</div></div>
+
+<script>
+(function () {
+  'use strict';
+  const gate = document.getElementById('lc3-gate');
+
+  function showLogin(message) {
+    gate.innerHTML =
+      '<form class="card" id="lf">' +
+      '<h1>LC3 Classroom</h1>' +
+      '<label>Username</label><input id="u" autocomplete="username" autofocus>' +
+      '<label>Password</label><input id="p" type="password" autocomplete="current-password">' +
+      '<button type="submit">Sign in</button>' +
+      '<div class="err" id="e">' + (message || '') + '</div>' +
+      '</form>';
+    document.getElementById('lf').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const e = document.getElementById('e'); e.textContent = '';
+      try {
+        const r = await fetch('/api/login', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('u').value.trim(),
+            password: document.getElementById('p').value
+          })
+        });
+        if (!r.ok) { e.textContent = 'Wrong username or password.'; return; }
+        // The login reply is minimal; fetch the full identity (with the class
+        // language) so the right runtime is mounted.
+        const meResp = await fetch('/api/me', { credentials: 'same-origin' });
+        start(meResp.ok ? await meResp.json() : await r.json());
+      } catch (x) { e.textContent = 'Server unreachable.'; }
+    });
+  }
+
+  // The one hidden runtime iframe. It loads only the class's language engine and
+  // executes the student's code, streaming output to the terminal.
+  function mountRuntime(lang) {
+    // Python runs here (Pyodide); Java is only syntax-checked here (it executes
+    // on the cluster). Either way the hidden runtime iframe carries it.
+    if (lang !== 'python' && lang !== 'java') return;
+    // Exactly one runtime, ever: more than one would execute each run in
+    // parallel and print the output several times.
+    document.querySelectorAll('#lc3-runtime').forEach((n) => n.remove());
+    const f = document.createElement('iframe');
+    f.id = 'lc3-runtime';
+    f.src = '/runtime/?lang=' + encodeURIComponent(lang);
+    f.style.cssText = 'position:absolute;width:0;height:0;border:0;visibility:hidden;';
+    f.setAttribute('aria-hidden', 'true');
+    // Attach to <html>, not <body>: the workbench rebuilds body's children as it
+    // renders, which would detach a body-level iframe.
+    document.documentElement.appendChild(f);
+  }
+
+  async function bootWorkbench() {
+    const origin = window.location.origin;
+    const secure = window.location.protocol === 'https:';
+    window.product = {
+      productConfiguration: {
+        nameShort: 'LC3 Code',
+        nameLong: 'LC3 Classroom Code',
+        applicationName: 'lc3-code',
+        dataFolderName: '.lc3-code',
+        version: '1.91.1',
+        extensionsGallery: undefined,
+        extensionEnabledApiProposals: {},
+        configurationDefaults: {
+          'workbench.colorTheme': 'Default Dark Modern',
+          'files.autoSave': 'afterDelay',
+          'files.autoSaveDelay': 800,
+          'workbench.startupEditor': 'none',
+          'workbench.tips.enabled': false,
+          'workbench.welcomePage.walkthroughs.openOnInstall': false,
+          'workbench.activityBar.location': 'default',
+          'security.workspace.trust.enabled': false,
+          'telemetry.telemetryLevel': 'off',
+          'update.mode': 'none',
+          'extensions.ignoreRecommendations': true,
+          'editor.minimap.enabled': false,
+          'editor.fontSize': 14,
+          'explorer.confirmDelete': false,
+          'explorer.confirmDragAndDrop': false
+        }
+      },
+      folderUri: { scheme: 'lc3', authority: '', path: '/' },
+      additionalBuiltinExtensions: [
+        { scheme: secure ? 'https' : 'http', authority: window.location.host, path: '/ide-ext/lc3' }
+      ]
+    };
+    function load(src) {
+      return new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = src; s.onload = res; s.onerror = () => rej(new Error('failed ' + src));
+        document.head.appendChild(s);
+      });
+    }
+    const base = origin + '/ide';
+    await load(base + '/out/vs/loader.js');
+    await load(base + '/out/vs/webPackagePaths.js');
+    Object.keys(self.webPackagePaths).map(function (key) {
+      self.webPackagePaths[key] = base + '/node_modules/' + key + '/' + self.webPackagePaths[key];
+    });
+    require.config({
+      baseUrl: base + '/out',
+      recordStats: true,
+      trustedTypesPolicy: window.trustedTypes && window.trustedTypes.createPolicy('amdLoader', {
+        createScriptURL(value) {
+          if (value.startsWith(window.location.origin)) { return value; }
+          throw new Error('Invalid script url: ' + value);
+        }
+      }),
+      paths: self.webPackagePaths
+    });
+    await load(base + '/out/vs/workbench/workbench.web.main.nls.js');
+    await load(base + '/out/vs/workbench/workbench.web.main.js');
+    await load(base + '/out/vs/code/browser/workbench/workbench.js');
+    gate.remove();
+  }
+
+  async function start(me) {
+    try { await bootWorkbench(); }
+    catch (e) { gate.innerHTML = '<div class="loading">Failed to load the editor. Reload the page.</div>'; return; }
+    // Mount after the workbench builds its DOM: booting replaces document.body's
+    // children, so an iframe added earlier would be discarded. Python classes
+    // (and teachers, who author and test) get the Python runtime; Java classes
+    // get the browser Java syntax checker. Execution of Java is on the cluster.
+    if (me) {
+      const lang = me.lang || (me.role === 'teacher' ? 'python' : '');
+      if (lang) mountRuntime(lang);
+    }
+  }
+
+  (async function () {
+    let me = null;
+    try {
+      const r = await fetch('/api/me', { credentials: 'same-origin' });
+      if (r.ok) me = await r.json();
+    } catch (e) {
+      gate.innerHTML = '<div class="loading">LC3 server unreachable.</div>'; return;
+    }
+    if (me) start(me); else showLogin('');
+  })();
+})();
+</script>
+</body>
+</html>

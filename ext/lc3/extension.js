@@ -1,0 +1,899 @@
+/* LC3 web extension.
+ *
+ * Provides the student's whole workflow inside the VS Code page:
+ *   - a REST-backed file system on the lc3: scheme,
+ *   - Run, which executes the open file in a hidden same-origin runtime iframe
+ *     and streams its output into an integrated terminal (over a
+ *     BroadcastChannel the runtime and this extension share),
+ *   - Submit, which grades against the private tests on the cluster,
+ *   - editor diagnostics (squiggles + Problems) from syntax and compile errors,
+ *   - a teacher-only Class Management panel that talks to the admin API through
+ *     this extension (the webview cannot send the session cookie itself).
+ */
+const vscode = require('vscode');
+
+const ORIGIN = (typeof self !== 'undefined' && self.location) ? self.location.origin : '';
+function api(path) { return ORIGIN + path; }
+
+async function req(method, path, body) {
+  const opts = { method, credentials: 'same-origin' };
+  if (body !== undefined) {
+    if (body instanceof Uint8Array) {
+      opts.body = body;
+      opts.headers = { 'Content-Type': 'application/octet-stream' };
+    } else {
+      opts.body = JSON.stringify(body);
+      opts.headers = { 'Content-Type': 'application/json' };
+    }
+  }
+  return fetch(api(path), opts);
+}
+
+function rid() { return Math.random().toString(36).slice(2, 10); }
+function enc(s) { return new TextEncoder().encode(s); }
+
+/* ------------------------------ file system ------------------------------ */
+
+function fsError(status, uri) {
+  if (status === 404) return vscode.FileSystemError.FileNotFound(uri);
+  if (status === 401) return vscode.FileSystemError.NoPermissions('Not logged in - reload the page');
+  return vscode.FileSystemError.Unavailable('LC3 server error ' + status);
+}
+
+class Lc3Fs {
+  constructor() {
+    this._emitter = new vscode.EventEmitter();
+    this.onDidChangeFile = this._emitter.event;
+  }
+  watch() { return new vscode.Disposable(() => {}); }
+  async stat(uri) {
+    if (uri.path === '/' || uri.path === '') {
+      return { type: vscode.FileType.Directory, ctime: 0, mtime: 0, size: 0 };
+    }
+    const resp = await req('GET', '/api/fs/stat?path=' + encodeURIComponent(uri.path));
+    if (!resp.ok) throw fsError(resp.status, uri);
+    const j = await resp.json();
+    return {
+      type: j.type === 'dir' ? vscode.FileType.Directory : vscode.FileType.File,
+      ctime: j.mtime, mtime: j.mtime, size: j.size
+    };
+  }
+  async readDirectory(uri) {
+    const resp = await req('GET', '/api/fs/list?path=' + encodeURIComponent(uri.path || '/'));
+    if (!resp.ok) throw fsError(resp.status, uri);
+    const j = await resp.json();
+    return j.entries.map(e =>
+      [e.name, e.type === 'dir' ? vscode.FileType.Directory : vscode.FileType.File]);
+  }
+  async readFile(uri) {
+    const resp = await req('GET', '/api/fs/read?path=' + encodeURIComponent(uri.path));
+    if (!resp.ok) throw fsError(resp.status, uri);
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+  async writeFile(uri, content) {
+    const resp = await req('POST', '/api/fs/write?path=' + encodeURIComponent(uri.path), content);
+    if (!resp.ok) throw fsError(resp.status, uri);
+    this._emitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+  }
+  async createDirectory(uri) {
+    const resp = await req('POST', '/api/fs/mkdir?path=' + encodeURIComponent(uri.path));
+    if (!resp.ok) throw fsError(resp.status, uri);
+  }
+  async delete(uri) {
+    const resp = await req('POST', '/api/fs/delete?path=' + encodeURIComponent(uri.path));
+    if (!resp.ok) throw fsError(resp.status, uri);
+    this._emitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
+  }
+  async rename(oldUri, newUri) {
+    const resp = await req('POST', '/api/fs/rename?src=' + encodeURIComponent(oldUri.path)
+      + '&dst=' + encodeURIComponent(newUri.path));
+    if (!resp.ok) throw fsError(resp.status, oldUri);
+  }
+}
+
+/* ------------------------------- terminal -------------------------------- */
+// A Pseudoterminal: pure JS, no backend pty. It renders streamed program
+// output and, during a Python run, feeds typed lines to the program's stdin.
+
+class RunTerminal {
+  constructor() {
+    this.writeEmitter = new vscode.EventEmitter();
+    this.onDidWrite = this.writeEmitter.event;
+    this.closeEmitter = new vscode.EventEmitter();
+    this.onDidClose = this.closeEmitter.event;
+    this.line = '';
+    this.mode = 'idle';        // idle | run (python) | exec (cluster JVM)
+    this.runId = null;         // python run id for the stdin relay
+    this.execRun = null;       // cluster run id for interactive input
+  }
+  open() { this.raw('\x1b[2mLC3 terminal. Open a file and press Run (F5).\x1b[0m\r\n'); }
+  close() {}
+  raw(text) { this.writeEmitter.fire(text); }
+  write(text) { this.writeEmitter.fire(String(text).replace(/\r?\n/g, '\r\n')); }
+  dim(text) { this.raw('\x1b[2m' + text + '\x1b[0m\r\n'); }
+
+  handleInput(data) {
+    for (const ch of data) {
+      if (ch === '\x03') { // Ctrl+C works whether or not a program is running
+        this.raw('^C\r\n'); this.line = ''; stopActiveRun(); continue;
+      }
+      // Only a running program reads stdin. Ignore (and don't echo) anything
+      // typed while idle, so keystrokes entered before Run never linger in the
+      // line buffer and get swallowed by the program's first input() call.
+      if (this.mode !== 'run' && this.mode !== 'exec') continue;
+      if (ch === '\r') {
+        this.raw('\r\n');
+        const line = this.line; this.line = '';
+        if (this.mode === 'run' && this.runId) {
+          req('POST', '/api/run/stdin?run=' + encodeURIComponent(this.runId), enc(line));
+        } else if (this.mode === 'exec' && this.execRun) {
+          req('POST', '/api/run/exec/input?run=' + encodeURIComponent(this.execRun), enc(line));
+        }
+      } else if (ch === '\x7f' || ch === '\b') {
+        if (this.line.length) { this.line = this.line.slice(0, -1); this.raw('\b \b'); }
+      } else if (ch >= ' ') {
+        this.line += ch; this.raw(ch);
+      }
+    }
+  }
+}
+
+let term = null, termInstance = null;
+function getTerminal() {
+  if (!term) {
+    termInstance = new RunTerminal();
+    term = vscode.window.createTerminal({ name: 'LC3 Run', pty: termInstance });
+  }
+  return { ui: term, pty: termInstance };
+}
+
+function stopActiveRun() {
+  if (!termInstance) return;
+  if (termInstance.execRun) {
+    req('POST', '/api/run/exec/kill?run=' + encodeURIComponent(termInstance.execRun));
+    termInstance.execRun = null;
+  }
+  if (termInstance.runId) {
+    req('POST', '/api/run/stdin?run=' + encodeURIComponent(termInstance.runId) + '&end=1');
+    if (bc) bc.postMessage({ t: 'stop' }); // kill the Python worker (e.g. infinite loop)
+    termInstance.runId = null;
+  }
+  termInstance.mode = 'idle';
+  termInstance.line = '';
+}
+
+/* ---------------------------- run controller ----------------------------- */
+
+let bc = null;
+let diagnostics = null;
+let me = { username: '', role: '', lang: '' };
+const runtimePending = new Map(); // reqId -> resolver, for format round-trips
+
+// Ask the runtime iframe something and await its reply (used for formatting).
+function runtimeRequest(msg, timeoutMs) {
+  return new Promise((resolve) => {
+    if (!bc) { resolve(null); return; }
+    const reqId = rid();
+    const timer = setTimeout(() => { runtimePending.delete(reqId); resolve(null); }, timeoutMs);
+    runtimePending.set(reqId, (data) => { clearTimeout(timer); resolve(data); });
+    bc.postMessage(Object.assign({ reqId }, msg));
+  });
+}
+
+function activeLc3File() {
+  const ed = vscode.window.activeTextEditor;
+  if (!ed || ed.document.uri.scheme !== 'lc3') return null;
+  return ed.document.uri.path;
+}
+
+function langFor(path) {
+  // The file decides how it runs. The class language only chooses which engine
+  // is preloaded; the runtime loads the other on demand if a file needs it.
+  if (path.endsWith('.java')) return 'java';
+  if (path.endsWith('.py')) return 'python';
+  return me.lang || 'python';
+}
+
+function parseJavacDiags(text, entry) {
+  // e.g. Greeter.java:5: error: ';' expected
+  const diags = [];
+  const re = /(^|\n)([\w./$-]+\.java):(\d+): (error|warning): ([^\n]*)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    diags.push({ file: m[2].split('/').pop(), line: parseInt(m[3], 10), col: 1,
+                 message: m[5], severity: m[4] === 'warning' ? 'warning' : 'error' });
+  }
+  return diags;
+}
+
+// Java runs on a real JVM in the cluster. Compile + start on a runner, then
+// stream its stdout to the terminal and its typed lines back to stdin, so
+// Scanner/System.in actually wait for input.
+async function runJavaCluster(path, pty) {
+  pty.dim('[compiling and starting on the cluster]');
+  let resp;
+  try { resp = await req('POST', '/api/run/exec/start', { path }); }
+  catch (e) { pty.dim('could not reach a runner'); return; }
+  if (!resp.ok) {
+    let d = ''; try { d = (await resp.json()).detail; } catch (e) {}
+    pty.dim('run failed: ' + (d || resp.status)); return;
+  }
+  const r = await resp.json();
+  if (r.status === 'busy') { pty.dim('all runners are busy right now; try again in a moment'); return; }
+  if (r.status === 'compile_error') {
+    pty.write((r.output || 'compile error') + '\n');
+    applyDiags(path, parseJavacDiags(r.output || '', path.split('/').pop()));
+    pty.dim('[compile error]'); return;
+  }
+  if (r.status !== 'running') { pty.dim('could not start the program'); return; }
+  applyDiags(path, []); // clear old diagnostics
+  pty.mode = 'exec'; pty.execRun = r.run;
+  const serverRun = r.run;
+  let since = 0, outAll = '';
+  while (pty.execRun === serverRun) {
+    let o;
+    try { o = await req('GET', '/api/run/exec/output?run=' + encodeURIComponent(serverRun) + '&since=' + since); }
+    catch (e) { pty.dim('[lost connection to the runner]'); break; }
+    if (!o.ok) { pty.dim('[runner error]'); break; }
+    const j = await o.json();
+    if (j.data) { pty.write(j.data); outAll += j.data; }
+    since = j.next;
+    if (j.done) {
+      pty.dim('[finished, exit code ' + j.exit + ']');
+      // Highlight the offending line if the program threw at runtime.
+      if (j.exit !== 0) applyDiags(path, parseJavaRuntimeError(outAll, path.split('/').pop()));
+      if (pty.execRun === serverRun) { pty.execRun = null; pty.mode = 'idle'; }
+      break;
+    }
+  }
+}
+
+// Pull the first stack frame in the student's own file out of a Java trace and
+// pair it with the exception message, so a runtime error squiggles the line.
+function parseJavaRuntimeError(text, entry) {
+  const frameRe = new RegExp('\\(' + entry.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':(\\d+)\\)');
+  const m = frameRe.exec(text);
+  if (!m) return [];
+  let msg = 'runtime error';
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (/(Exception|Error)\b/.test(t) && !t.startsWith('at ')) { msg = t.replace(/^Exception in thread "\w+"\s*/, ''); break; }
+  }
+  return [{ line: parseInt(m[1], 10), col: 1, message: msg, severity: 'error' }];
+}
+
+async function runCommand() {
+  const path = activeLc3File();
+  if (!path) { vscode.window.showWarningMessage('Open a .py or .java file first.'); return; }
+  await vscode.workspace.saveAll(false);
+  const lang = langFor(path);
+  const { ui, pty } = getTerminal();
+  ui.show(); // focus the terminal so the student can type input into it
+  stopActiveRun(); // end any run already in progress
+  pty.raw('\r\n\x1b[1m$ run ' + path.split('/').pop() + '\x1b[0m\r\n');
+
+  if (lang === 'java') {
+    await runJavaCluster(path, pty);
+  } else {
+    if (!bc) { pty.dim('the Python runtime is not loaded; reload the page'); return; }
+    const runId = rid();
+    pty.runId = runId; pty.mode = 'run';
+    bc.postMessage({ t: 'run', runId, lang: 'python', path });
+  }
+}
+
+async function submitCommand() {
+  const path = activeLc3File();
+  if (!path) { vscode.window.showWarningMessage('Open a file inside an assignment folder first.'); return; }
+  const assignment = path.split('/').filter(Boolean)[0];
+  if (!assignment) { vscode.window.showWarningMessage('Put your work in an assignment folder before submitting.'); return; }
+  await vscode.workspace.saveAll(false);
+  const pick = await vscode.window.showWarningMessage(
+    'Submit "' + assignment + '" for grading?', { modal: true }, 'Submit');
+  if (pick !== 'Submit') return;
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'Grading ' + assignment + '...' },
+    async () => {
+      let resp;
+      try { resp = await req('POST', '/api/submit', { assignment }); }
+      catch (e) { vscode.window.showErrorMessage('Could not reach the grader.'); return; }
+      if (!resp.ok) {
+        let msg = 'Submit failed (' + resp.status + ')';
+        try { msg += ': ' + (await resp.json()).detail; } catch (e) {}
+        vscode.window.showErrorMessage(msg); return;
+      }
+      const r = await resp.json();
+      const { ui, pty } = getTerminal();
+      ui.show(true);
+      pty.raw('\r\n\x1b[1m$ submit ' + assignment + '\x1b[0m\r\n');
+      for (const t of r.tests) {
+        pty.raw((t.passed ? '\x1b[32m  PASS  \x1b[0m' : '\x1b[31m  FAIL  \x1b[0m') + t.name + '\r\n');
+      }
+      pty.dim('result: ' + r.passed + ' passed, ' + r.failed + ' failed  (status: ' + r.status + ')');
+      if (r.status === 'compile_error') {
+        vscode.window.showErrorMessage(assignment + ': your code does not compile. Use Run to see details.');
+      } else if (r.status === 'timeout') {
+        vscode.window.showErrorMessage(assignment + ': your code ran too long (infinite loop?).');
+      } else if (r.failed === 0 && r.passed > 0) {
+        vscode.window.showInformationMessage(assignment + ': all ' + r.passed + ' tests passed!');
+      } else {
+        vscode.window.showWarningMessage(assignment + ': ' + r.passed + ' passed, ' + r.failed + ' failed.');
+      }
+    });
+}
+
+/* ----------------------------- diagnostics ------------------------------- */
+
+function applyDiags(path, diags) {
+  const folder = path.slice(0, path.lastIndexOf('/') + 1);
+  const byUri = new Map();
+  for (const d of (diags || [])) {
+    const p = d.file ? folder + d.file : path;
+    const uri = vscode.Uri.from({ scheme: 'lc3', path: p });
+    const line = Math.max(0, (d.line || 1) - 1);
+    const col = Math.max(0, (d.col || 1) - 1);
+    const range = new vscode.Range(line, col, line, 4096);
+    const sev = d.severity === 'warning'
+      ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
+    const list = byUri.get(uri.toString()) || [];
+    list.push(new vscode.Diagnostic(range, d.message || 'error', sev));
+    byUri.set(uri.toString(), list);
+  }
+  // Always clear the run file first, then set whatever came back.
+  diagnostics.set(vscode.Uri.from({ scheme: 'lc3', path }), []);
+  for (const [key, list] of byUri) diagnostics.set(vscode.Uri.parse(key), list);
+}
+
+function onRuntimeMessage(ev) {
+  const m = ev.data || {};
+  // Program output lands in the terminal. Ensure it exists (a message can arrive
+  // before the terminal reference is cached) and match it to the active run.
+  if (m.t === 'out' || m.t === 'status' || m.t === 'exit') {
+    const t = getTerminal().pty;
+    if (t.runId && m.runId && t.runId !== m.runId) return; // a stale/other run
+    if (m.t === 'out') {
+      t.write(m.data);
+    } else if (m.t === 'status') {
+      t.dim('[' + m.text + ']');
+    } else if (m.t === 'exit') {
+      t.dim('[finished, exit code ' + m.code + ']');
+      t.runId = null; t.mode = 'idle';
+    }
+    return;
+  }
+  if (m.t === 'diags') {
+    applyDiags(m.path, m.diags);
+  } else if (m.t === 'formatted') {
+    const cb = runtimePending.get(m.reqId);
+    if (cb) { runtimePending.delete(m.reqId); cb(m); }
+  } else if (m.t === 'ready') {
+    if (m.error && termInstance) termInstance.dim('runtime warning: ' + m.error);
+  }
+}
+
+/* --------------------------- admin (teacher) ----------------------------- */
+// Native VS Code UI: a tree view of classes, students, assignments, workers,
+// and submissions, with actions run through input boxes and the file-open
+// dialog. Webviews are not available over plain HTTP, so nothing here uses one.
+
+let adminTree = null;
+
+async function getJSON(path) {
+  const r = await req('GET', path);
+  if (!r.ok) throw new Error('server returned ' + r.status);
+  return r.json();
+}
+async function postJSON(path, body) {
+  const r = await req('POST', path, body);
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((j && j.detail) || ('server returned ' + r.status));
+  return j;
+}
+function adminError(e) { vscode.window.showErrorMessage('LC3: ' + ((e && e.message) || e)); }
+
+function sectionItem(label, ctx, icon) {
+  const it = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.Collapsed);
+  it.contextValue = ctx;              // sec:classes, sec:students, ...
+  it.section = ctx.split(':')[1];
+  it.iconPath = new vscode.ThemeIcon(icon);
+  return it;
+}
+
+class AdminTree {
+  constructor() {
+    this._emitter = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this._emitter.event;
+  }
+  refresh() { this._emitter.fire(); }
+  getTreeItem(e) { return e; }
+  async getChildren(node) {
+    if (!node) {
+      return [
+        sectionItem('Classes', 'sec:classes', 'symbol-class'),
+        sectionItem('Students', 'sec:students', 'account'),
+        sectionItem('Assignments', 'sec:assignments', 'book'),
+        sectionItem('Workers', 'sec:workers', 'server-environment'),
+        sectionItem('Recent submissions', 'sec:submissions', 'checklist'),
+      ];
+    }
+    try {
+      if (node.section === 'classes') {
+        const j = await getJSON('/api/admin/classes');
+        return (j.classes || []).map((c) => {
+          const it = new vscode.TreeItem(c.id + '  ·  ' + c.lang);
+          it.description = c.name; it.contextValue = 'class'; it.lc3 = c;
+          it.iconPath = new vscode.ThemeIcon('symbol-class');
+          return it;
+        });
+      }
+      if (node.section === 'students') {
+        const j = await getJSON('/api/admin/students');
+        return (j.users || []).filter((u) => u.role === 'student').map((u) => {
+          const it = new vscode.TreeItem(u.username);
+          it.description = u.class || '(no class)'; it.contextValue = 'student'; it.lc3 = u;
+          it.iconPath = new vscode.ThemeIcon('account');
+          return it;
+        });
+      }
+      if (node.section === 'assignments') {
+        const j = await getJSON('/api/assignments');
+        return (j.assignments || []).map((a) => {
+          const it = new vscode.TreeItem(a.id);
+          it.description = (a.classes || []).join(', ') + '  ·  ' + a.language +
+            (a.closed ? '  ·  closed' : '');
+          it.contextValue = 'assignment'; it.lc3 = a;
+          it.iconPath = new vscode.ThemeIcon(a.closed ? 'lock' : 'book');
+          return it;
+        });
+      }
+      if (node.section === 'workers') {
+        const j = await getJSON('/api/admin/workers');
+        return (j.workers || []).map((w) => {
+          const it = new vscode.TreeItem(w.host + (w.local ? '  (gateway)' : ''));
+          it.description = w.status; it.contextValue = w.local ? 'worker.local' : 'worker'; it.lc3 = w;
+          it.iconPath = new vscode.ThemeIcon(
+            w.status === 'up' ? 'pass' : (w.status === 'error' ? 'error' : 'circle-slash'));
+          it.tooltip = w.note || '';
+          return it;
+        });
+      }
+      if (node.section === 'submissions') {
+        const j = await getJSON('/api/admin/submissions');
+        return (j.submissions || []).slice(0, 50).map((s) => {
+          const it = new vscode.TreeItem(s.username + ' · ' + s.assignment);
+          it.description = s.passed + '/' + (s.passed + s.failed) + '  (' + s.status + ')';
+          it.contextValue = 'submission';
+          it.iconPath = new vscode.ThemeIcon(s.failed === 0 && s.passed > 0 ? 'pass' : 'warning');
+          return it;
+        });
+      }
+    } catch (e) {
+      const it = new vscode.TreeItem('(failed to load - ' + ((e && e.message) || e) + ')');
+      return [it];
+    }
+    return [];
+  }
+}
+
+async function pickClass(placeHolder, includeNone) {
+  const j = await getJSON('/api/admin/classes');
+  const items = (j.classes || []).map((c) => ({ label: c.id, description: c.name + ' (' + c.lang + ')' }));
+  if (includeNone) items.unshift({ label: '(no class)', description: '', _none: true });
+  if (!items.length) { vscode.window.showWarningMessage('LC3: create a class first.'); return undefined; }
+  const p = await vscode.window.showQuickPick(items, { placeHolder });
+  if (!p) return undefined;
+  return p._none ? '' : p.label;
+}
+
+async function pickClasses(placeHolder) {
+  const j = await getJSON('/api/admin/classes');
+  const classes = j.classes || [];
+  if (!classes.length) { vscode.window.showWarningMessage('LC3: create a class first.'); return undefined; }
+  const picks = await vscode.window.showQuickPick(
+    classes.map((c) => ({ label: c.id, description: c.name + ' (' + c.lang + ')', lang: c.lang })),
+    { placeHolder, canPickMany: true });
+  if (!picks || !picks.length) return undefined;
+  const langs = new Set(picks.map((p) => p.lang));
+  if (langs.size > 1) {
+    vscode.window.showErrorMessage('LC3: an assignment can only span classes of the same language.');
+    return undefined;
+  }
+  return picks.map((p) => p.label);
+}
+
+async function confirmModal(message) {
+  const pick = await vscode.window.showWarningMessage(message, { modal: true }, 'Yes');
+  return pick === 'Yes';
+}
+
+function bytesToB64(bytes) {
+  let bin = ''; const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+function registerAdmin(context) {
+  adminTree = new AdminTree();
+  // Read-only view of a recalled submission's files (scheme lc3grade:).
+  const gradeDocs = {
+    provideTextDocumentContent: async (uri) => {
+      const parts = uri.path.replace(/^\//, '').split('/');
+      const assignment = parts.shift(), user = parts.shift(), rel = parts.join('/');
+      try {
+        const r = await req('GET', '/api/admin/collected/read?assignment=' +
+          encodeURIComponent(assignment) + '&user=' + encodeURIComponent(user) +
+          '&path=' + encodeURIComponent(rel));
+        return r.ok ? await r.text() : '// could not load ' + rel;
+      } catch (e) { return '// error loading ' + rel; }
+    },
+  };
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider('lc3grade', gradeDocs),
+    vscode.window.registerTreeDataProvider('lc3.admin', adminTree),
+    vscode.commands.registerCommand('lc3.admin.refresh', () => adminTree.refresh()),
+
+    vscode.commands.registerCommand('lc3.addClass', async () => {
+      try {
+        const id = await vscode.window.showInputBox({ prompt: 'Class id (letters, numbers, - or _)' });
+        if (!id) return;
+        const name = await vscode.window.showInputBox({ prompt: 'Class name', value: id });
+        if (name === undefined) return;
+        const lang = await vscode.window.showQuickPick(['python', 'java'], { placeHolder: 'Language' });
+        if (!lang) return;
+        await postJSON('/api/admin/classes', { id: id.trim(), name, lang });
+        adminTree.refresh();
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.deleteClass', async (item) => {
+      const id = item && item.lc3 && item.lc3.id; if (!id) return;
+      if (!await confirmModal('Delete class "' + id + '"? Its students keep their accounts but lose the class.')) return;
+      try { await postJSON('/api/admin/classes/delete', { id }); adminTree.refresh(); } catch (e) { adminError(e); }
+    }),
+
+    vscode.commands.registerCommand('lc3.addStudent', async () => {
+      try {
+        const username = await vscode.window.showInputBox({ prompt: 'Student username' });
+        if (!username) return;
+        const password = await vscode.window.showInputBox({ prompt: 'Password' });
+        if (!password) return;
+        const cls = await pickClass('Class for this student', true);
+        if (cls === undefined) return;
+        await postJSON('/api/admin/students', { username: username.trim(), password, class: cls });
+        adminTree.refresh();
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.addStudents', async () => {
+      try {
+        const cls = await pickClass('Class for the new students', true);
+        if (cls === undefined) return;
+        const how = await vscode.window.showQuickPick([
+          { label: 'Choose a CSV file', description: 'username,password per line', id: 'file' },
+          { label: 'Paste a CSV', description: 'for a handful of students', id: 'paste' },
+        ], { placeHolder: 'Add students from...' });
+        if (!how) return;
+        let csv;
+        if (how.id === 'file') {
+          const uris = await vscode.window.showOpenDialog({
+            canSelectMany: false, openLabel: 'Import',
+            filters: { 'CSV / text': ['csv', 'txt'] } });
+          if (!uris || !uris.length) return;
+          csv = new TextDecoder().decode(await vscode.workspace.fs.readFile(uris[0]));
+        } else {
+          csv = await vscode.window.showInputBox({
+            prompt: 'CSV rows, semicolon between students',
+            placeHolder: 'alice,pw1; bob,pw2; carol,pw3' });
+          if (!csv) return;
+          csv = csv.replace(/;/g, '\n');
+        }
+        const j = await postJSON('/api/admin/students/bulk', { class: cls, csv });
+        adminTree.refresh();
+        vscode.window.showInformationMessage(
+          'LC3: added ' + j.created.length + ' students' +
+          (j.skipped && j.skipped.length
+            ? (', skipped ' + j.skipped.length + ' (already exist or missing a password)') : '') + '.');
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.setStudentClass', async (item) => {
+      const username = item && item.lc3 && item.lc3.username; if (!username) return;
+      const cls = await pickClass('Move ' + username + ' to class', true);
+      if (cls === undefined) return;
+      try { await postJSON('/api/admin/students/setclass', { username, class: cls }); adminTree.refresh(); } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.deleteStudent', async (item) => {
+      const username = item && item.lc3 && item.lc3.username; if (!username) return;
+      if (!await confirmModal('Delete student "' + username + '"?')) return;
+      try { await postJSON('/api/admin/students/delete', { username }); adminTree.refresh(); } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.resetPassword', async (item) => {
+      const username = item && item.lc3 && item.lc3.username; if (!username) return;
+      const pw = await vscode.window.showInputBox({ prompt: 'New password for ' + username });
+      if (!pw) return;
+      try {
+        await postJSON('/api/admin/students/setpassword', { username, password: pw });
+        vscode.window.showInformationMessage('LC3: reset password for ' + username + '.');
+      } catch (e) { adminError(e); }
+    }),
+
+    vscode.commands.registerCommand('lc3.createAssignment', async () => {
+      try {
+        const classes = await pickClasses('Class(es) for this assignment (space to select more)');
+        if (!classes) return;
+        const active = vscode.window.activeTextEditor;
+        const def = (active && active.document.uri.scheme === 'lc3')
+          ? active.document.uri.path.replace(/\/[^/]*$/, '') : '';
+        const folder = await vscode.window.showInputBox({
+          prompt: 'Folder in your files containing starter/ and tests/', value: def });
+        if (!folder) return;
+        const id = await vscode.window.showInputBox({ prompt: 'Assignment id (blank = folder name)' });
+        if (id === undefined) return;
+        const j = await postJSON('/api/admin/assignments/from-folder',
+          { folder, id: id.trim(), classes });
+        adminTree.refresh();
+        vscode.window.showInformationMessage(
+          'LC3: created "' + j.id + '" and published to ' + j.published_to + ' students.');
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.deleteAssignment', async (item) => {
+      const id = item && item.lc3 && item.lc3.id; if (!id) return;
+      if (!await confirmModal('Delete assignment "' + id +
+        '"? This removes it, its grades, and every student\'s copy.')) return;
+      try { await postJSON('/api/admin/assignments/delete', { id }); adminTree.refresh(); } catch (e) { adminError(e); }
+    }),
+
+    vscode.commands.registerCommand('lc3.uploadAssignment', async () => {
+      try {
+        const classes = await pickClasses('Class(es) for this assignment (space to select more)');
+        if (!classes) return;
+        const uris = await vscode.window.showOpenDialog({
+          canSelectMany: false, openLabel: 'Upload', filters: { 'Zip archives': ['zip'] } });
+        if (!uris || !uris.length) return;
+        const bytes = await vscode.workspace.fs.readFile(uris[0]);
+        const id = await vscode.window.showInputBox({
+          prompt: 'Assignment id (leave blank to use assignment.json in the zip)' });
+        if (id === undefined) return;
+        const j = await postJSON('/api/admin/assignments/upload',
+          { classes, id: id.trim(), zip_b64: bytesToB64(bytes) });
+        vscode.window.showInformationMessage(
+          'LC3: uploaded "' + j.id + '" to ' + classes.join(', ') +
+          ' and published to ' + j.published_to + ' students.');
+        adminTree.refresh();
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.publishAssignment', async (item) => {
+      const id = item && item.lc3 && item.lc3.id; if (!id) return;
+      try {
+        const j = await postJSON('/api/admin/assignments/publish', { id });
+        adminTree.refresh();
+        vscode.window.showInformationMessage('LC3: published "' + id + '" to ' + j.published_to + ' students.');
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.unpublishAssignment', async (item) => {
+      const id = item && item.lc3 && item.lc3.id; if (!id) return;
+      try {
+        await postJSON('/api/admin/assignments/unpublish', { id });
+        adminTree.refresh();
+        vscode.window.showInformationMessage('LC3: unpublished "' + id + '" (hidden from students).');
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.recallAssignment', async (item) => {
+      const id = item && item.lc3 && item.lc3.id; if (!id) return;
+      try {
+        const j = await postJSON('/api/admin/assignments/recall', { id });
+        vscode.window.showInformationMessage('LC3: recalled ' + j.collected + ' submissions for "' + id + '".');
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.gradeAssignment', async (item) => {
+      const id = item && item.lc3 && item.lc3.id; if (!id) return;
+      try {
+        await postJSON('/api/admin/assignments/recall', { id }); // fresh snapshot
+        const col = await getJSON('/api/admin/collected?assignment=' + encodeURIComponent(id));
+        const students = col.students || [];
+        if (!students.length) {
+          vscode.window.showInformationMessage('LC3: no submissions to grade yet for "' + id + '".');
+          return;
+        }
+        // Grade students one by one until the teacher dismisses the picker.
+        for (;;) {
+          const pick = await vscode.window.showQuickPick(
+            students.map((s) => ({
+              label: s.username,
+              description: (s.score ? 'grade: ' + s.score : 'ungraded') +
+                '  ·  ' + (s.files.length ? s.files.length + ' files' : 'no work'),
+              s,
+            })),
+            { placeHolder: 'Grade "' + id + '" - pick a student (Esc when done)' });
+          if (!pick) break;
+          const s = pick.s;
+          for (const f of s.files.slice(0, 8)) {
+            const uri = vscode.Uri.parse('lc3grade:/' + id + '/' + s.username + '/' + f);
+            const doc = await vscode.workspace.openTextDocument(uri);
+            await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true });
+          }
+          const score = await vscode.window.showInputBox(
+            { prompt: 'Grade for ' + s.username + ' on "' + id + '"', value: s.score || '' });
+          if (score === undefined) continue;
+          const comment = await vscode.window.showInputBox(
+            { prompt: 'Comment (optional)', value: s.comment || '' });
+          await postJSON('/api/admin/grade',
+            { assignment: id, username: s.username, score, comment: comment || '' });
+          s.score = score; s.comment = comment || '';
+          adminTree.refresh();
+        }
+      } catch (e) { adminError(e); }
+    }),
+
+    vscode.commands.registerCommand('lc3.addWorker', async () => {
+      try {
+        const host = await vscode.window.showInputBox({ prompt: 'Raspberry Pi 3 IP address' });
+        if (!host) return;
+        const user = await vscode.window.showInputBox({ prompt: 'SSH user', value: 'alarm' });
+        if (user === undefined) return;
+        const password = await vscode.window.showInputBox({ prompt: 'SSH password', value: 'alarm' });
+        if (password === undefined) return;
+        const root = await vscode.window.showInputBox({ prompt: 'Root password', value: 'root' });
+        if (root === undefined) return;
+        await postJSON('/api/admin/workers', { host: host.trim(), user, password, root_password: root });
+        vscode.window.showInformationMessage('LC3: provisioning started; use Recheck in a minute.');
+        adminTree.refresh();
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.recheckWorkers', async () => {
+      try { await postJSON('/api/admin/workers/recheck', {}); adminTree.refresh(); } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.deleteWorker', async (item) => {
+      const host = item && item.lc3 && item.lc3.host; if (!host) return;
+      if (!await confirmModal('Remove worker "' + host + '"?')) return;
+      try { await postJSON('/api/admin/workers/delete', { host }); adminTree.refresh(); } catch (e) { adminError(e); }
+    }));
+
+  // Refresh the workers and submissions view periodically.
+  const timer = setInterval(() => adminTree.refresh(), 15000);
+  context.subscriptions.push(new vscode.Disposable(() => clearInterval(timer)));
+}
+
+/* ------------------------------- activate -------------------------------- */
+
+async function closeWelcomeTabs() {
+  try {
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const label = (tab.label || '').toLowerCase();
+        if (label.includes('welcome') || label.includes('get started') ||
+            label.includes('getting started')) {
+          await vscode.window.tabGroups.close(tab);
+        }
+      }
+    }
+  } catch (e) { /* tab API missing or nothing to close */ }
+}
+
+let activated = false;
+
+async function activate(context) {
+  if (activated) return; // never wire up the run channel or commands twice
+  activated = true;
+
+  const fs = new Lc3Fs();
+  context.subscriptions.push(
+    vscode.workspace.registerFileSystemProvider('lc3', fs, { isCaseSensitive: true }));
+
+  diagnostics = vscode.languages.createDiagnosticCollection('lc3');
+  context.subscriptions.push(diagnostics);
+
+  // Close the "Get Started" / Welcome tab so students land straight on their
+  // files, and so it never steals keyboard focus.
+  closeWelcomeTabs();
+  setTimeout(closeWelcomeTabs, 1200);
+
+  // Force the dark theme (the workbench default renders light otherwise).
+  try {
+    const wb = vscode.workspace.getConfiguration('workbench');
+    if (wb.get('colorTheme') !== 'Default Dark Modern') {
+      await wb.update('colorTheme', 'Default Dark Modern', vscode.ConfigurationTarget.Global);
+    }
+  } catch (e) { /* theme not settable; ignore */ }
+
+  try {
+    const resp = await req('GET', '/api/me');
+    if (resp.ok) me = await resp.json();
+  } catch (e) {}
+
+  if (typeof BroadcastChannel !== 'undefined') {
+    bc = new BroadcastChannel('lc3-run');
+    bc.onmessage = onRuntimeMessage;
+    context.subscriptions.push(new vscode.Disposable(() => bc.close()));
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('lc3.run', runCommand),
+    vscode.commands.registerCommand('lc3.submit', submitCommand),
+    vscode.commands.registerCommand('lc3.format', async () => {
+      const ed = vscode.window.activeTextEditor;
+      if (!ed || ed.document.uri.scheme !== 'lc3') {
+        vscode.window.showWarningMessage('Open a .py or .java file to format.'); return;
+      }
+      await vscode.commands.executeCommand('editor.action.formatDocument');
+    }),
+    vscode.commands.registerCommand('lc3.refresh', () =>
+      vscode.commands.executeCommand('workbench.files.action.refreshFilesExplorer')),
+    vscode.commands.registerCommand('lc3.logout', async () => {
+      await req('POST', '/api/logout');
+      vscode.window.showInformationMessage('Logged out. Reload the page to sign in again.');
+    }),
+    vscode.commands.registerCommand('lc3.changePassword', async () => {
+      const current = await vscode.window.showInputBox({ prompt: 'Current password', password: true });
+      if (!current) return;
+      const next = await vscode.window.showInputBox({
+        prompt: 'New password (at least 8 characters)', password: true,
+        validateInput: (v) => (v && v.length >= 8 ? null : 'Use at least 8 characters.') });
+      if (!next) return;
+      const confirm = await vscode.window.showInputBox({ prompt: 'Retype the new password', password: true });
+      if (confirm == null) return;
+      if (confirm !== next) { vscode.window.showErrorMessage('The two new passwords do not match.'); return; }
+      let resp;
+      try { resp = await req('POST', '/api/account/password', { current, new: next }); }
+      catch (e) { vscode.window.showErrorMessage('Could not reach the server.'); return; }
+      if (!resp.ok) {
+        let msg = 'Password change failed';
+        try { msg = (await resp.json()).detail || msg; } catch (e) {}
+        vscode.window.showErrorMessage('LC3: ' + msg); return;
+      }
+      vscode.window.showInformationMessage('LC3: password changed. Other sessions were signed out.');
+    }));
+
+  // Format Document (Shift+Alt+F): Python with black, Java with prettier, both
+  // in the browser via the runtime iframe.
+  const formatter = (lang) => ({
+    provideDocumentFormattingEdits: async (doc) => {
+      const src = doc.getText();
+      const res = await runtimeRequest({ t: 'format', lang, path: doc.uri.path, text: src }, 30000);
+      if (!res || res.text == null || res.text === src) return [];
+      const full = new vscode.Range(doc.positionAt(0), doc.positionAt(src.length));
+      return [vscode.TextEdit.replace(full, res.text)];
+    },
+  });
+  context.subscriptions.push(
+    vscode.languages.registerDocumentFormattingEditProvider({ scheme: 'lc3', language: 'python' }, formatter('python')),
+    vscode.languages.registerDocumentFormattingEditProvider({ scheme: 'lc3', language: 'java' }, formatter('java')));
+
+  // Browser syntax check as the student saves: Python via Pyodide, Java via the
+  // bundled JS parser. Both run in the hidden runtime iframe, no cluster load.
+  context.subscriptions.push(vscode.workspace.onDidSaveTextDocument((doc) => {
+    if (doc.uri.scheme !== 'lc3' || !bc) return;
+    if (doc.uri.path.endsWith('.py')) bc.postMessage({ t: 'check', lang: 'python', path: doc.uri.path });
+    else if (doc.uri.path.endsWith('.java')) bc.postMessage({ t: 'check', lang: 'java', path: doc.uri.path });
+  }));
+
+  // status bar: identity + run/submit, plus admin for teachers.
+  const idItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  idItem.text = '$(account) ' + (me.username || '');
+  idItem.tooltip = me.class ? ('Class: ' + me.class) : 'Logged in to LC3';
+  idItem.show();
+  const runItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+  runItem.text = '$(play) Run'; runItem.command = 'lc3.run';
+  runItem.tooltip = 'Run the open file in the terminal (F5)'; runItem.show();
+  const subItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
+  subItem.text = '$(rocket) Submit'; subItem.command = 'lc3.submit';
+  subItem.tooltip = 'Submit this assignment for grading'; subItem.show();
+  const fmtItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 96);
+  fmtItem.text = '$(list-flat) Format'; fmtItem.command = 'lc3.format';
+  fmtItem.tooltip = 'Format the open file (black / prettier)'; fmtItem.show();
+  context.subscriptions.push(idItem, runItem, subItem, fmtItem);
+
+  if (me.role === 'teacher') {
+    // Reveal the Class Management view container and wire up its actions.
+    await vscode.commands.executeCommand('setContext', 'lc3.isTeacher', true);
+    registerAdmin(context);
+    const adminItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 97);
+    adminItem.text = '$(mortar-board) Class Management';
+    adminItem.command = 'lc3.admin.focus';
+    adminItem.tooltip = 'Open the Class Management panel'; adminItem.show();
+    context.subscriptions.push(adminItem);
+  }
+}
+
+module.exports = { activate };

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>LC3 runtime</title>
+</head>
+<body>
+<!--
+  Hidden runtime host. Lives as an invisible iframe inside the VS Code page.
+  Python runs in a Web Worker (so a blocking input() or an infinite loop never
+  freezes the tab); this iframe just relays between the worker and the extension
+  (over a BroadcastChannel). Java is syntax-checked and formatted here in the
+  iframe with pure-JS tools; Java execution happens on the cluster.
+-->
+<script>
+'use strict';
+const LANG = new URLSearchParams(location.search).get('lang') || '';
+const bc = new BroadcastChannel('lc3-run');
+function post(msg) { bc.postMessage(msg); }
+
+async function fetchFile(path) {
+  const r = await fetch('/api/fs/read?path=' + encodeURIComponent(path), { credentials: 'same-origin' });
+  if (!r.ok) throw new Error('cannot read file (' + r.status + ')');
+  return r.text();
+}
+
+/* =============================== Python worker ============================= */
+// All Python work (run, syntax check, format) happens off the main thread.
+
+let worker = null;
+function ensureWorker() {
+  if (worker) return worker;
+  worker = new Worker('/runtime/pyodide-worker.js');
+  worker.onmessage = (e) => post(e.data); // relay worker output to the extension
+  worker.postMessage({ cmd: 'preload' });
+  return worker;
+}
+
+/* ========================= Java (syntax + format) ========================= */
+// Java executes on the cluster; here we only lint and format it, with bundled
+// JS tools, entirely in the browser.
+
+let javaParserReady = null;
+function ensureJavaParser() {
+  if (javaParserReady) return javaParserReady;
+  javaParserReady = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = '/runtime/java-parser.js';
+    s.onload = () => res(true);
+    s.onerror = () => rej(new Error('could not load the Java checker'));
+    document.head.appendChild(s);
+  });
+  return javaParserReady;
+}
+async function checkJava(path) {
+  try {
+    await ensureJavaParser();
+    const src = await fetchFile(path);
+    const raw = (self.lc3JavaParse ? self.lc3JavaParse(src) : []) || [];
+    post({ t: 'diags', path, diags: raw.map((d) => ({
+      line: d.line || 1, col: d.col || 1,
+      message: (d.message || 'syntax error').split('\n')[0].slice(0, 160), severity: 'error' })) });
+  } catch (e) { /* best-effort */ }
+}
+
+let javaFmtReady = null;
+function ensureJavaFormatter() {
+  if (javaFmtReady) return javaFmtReady;
+  javaFmtReady = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = '/runtime/java-format.js';
+    s.onload = () => res(true);
+    s.onerror = () => rej(new Error('no java formatter'));
+    document.head.appendChild(s);
+  });
+  return javaFmtReady;
+}
+async function formatJava(reqId, src) {
+  let text = src;
+  try { await ensureJavaFormatter(); if (self.lc3JavaFormat) text = await self.lc3JavaFormat(src); }
+  catch (e) { text = src; }
+  post({ t: 'formatted', reqId, text });
+}
+
+/* ================================ dispatch ================================ */
+
+const handledRuns = new Set();
+
+bc.onmessage = (ev) => {
+  const m = ev.data || {};
+  if (m.t === 'run') {
+    if (m.lang === 'java') return; // Java runs on the cluster, not here
+    if (handledRuns.has(m.runId)) return;
+    handledRuns.add(m.runId);
+    ensureWorker().postMessage({ cmd: 'run', runId: m.runId, path: m.path });
+  } else if (m.t === 'check') {
+    if (m.lang === 'java') checkJava(m.path);
+    else ensureWorker().postMessage({ cmd: 'check', path: m.path });
+  } else if (m.t === 'format') {
+    if (m.lang === 'java') formatJava(m.reqId, m.text);
+    else ensureWorker().postMessage({ cmd: 'format', reqId: m.reqId, text: m.text });
+  } else if (m.t === 'stop') {
+    // Terminate a runaway Python program and bring a fresh worker back up.
+    if (worker) { worker.terminate(); worker = null; }
+    handledRuns.clear();
+    ensureWorker();
+  }
+};
+
+// Preload the engine this student primarily needs.
+if (LANG === 'java') {
+  ensureJavaParser().then(() => post({ t: 'ready', lang: 'java' }))
+    .catch((e) => post({ t: 'ready', lang: 'java', error: String((e && e.message) || e) }));
+} else {
+  ensureWorker(); // preloads Pyodide in the worker; it posts {t:'ready'} itself
+}
+</script>
+</body>
+</html>

@@ -8,7 +8,11 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BASE="${1:-http://192.168.1.146}"
+BASE="${1:-${LC3_BASE:-}}"
+if [ -z "$BASE" ]; then
+    echo "usage: $0 <gateway-url>   (or set LC3_BASE)" >&2
+    exit 2
+fi
 BASE_HOST=$(echo "$BASE" | sed -E 's#https?://##; s#[:/].*##')
 JT=/tmp/lc3-jt; J=/tmp/lc3-jd; JS=/tmp/lc3-js
 pass=0; fail=0

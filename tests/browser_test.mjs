@@ -33,7 +33,11 @@ function findChrome() {
   process.exit(2);
 }
 
-const BASE = process.argv[2] || 'http://192.168.1.146';
+const BASE = process.argv[2] || process.env.LC3_BASE;
+if (!BASE) {
+  console.error('usage: node tests/browser_test.mjs <gateway-url>   (or set LC3_BASE)');
+  process.exit(2);
+}
 let pass = 0, fail = 0;
 const ok = (m) => { console.log('  ok   - ' + m); pass++; };
 const bad = (m) => { console.log('  FAIL - ' + m); fail++; };

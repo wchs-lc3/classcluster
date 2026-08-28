@@ -2,11 +2,15 @@
 # Push the repo to a password-auth Pi (user "alarm") and run the installer.
 # Same as sync_to_pi4.sh but for a non-root user reached with a password
 # instead of an SSH key, so every hop goes through sshpass and sudo -S.
-#   ./sync_to_pi_alarm.sh            push code + binary, keep existing VS Code build
-#   ./sync_to_pi_alarm.sh --vscode   also re-extract and re-trim the VS Code build
+#   PI_HOST=<ip> ./sync_to_pi_alarm.sh            push code + binary, keep the VS Code build
+#   PI_HOST=<ip> ./sync_to_pi_alarm.sh --vscode   also re-extract and re-trim it
+# PI_USER and PI_PASS default to alarm/alarm.
 set -euo pipefail
 
-PI_HOST="${PI_HOST:-10.25.10.12}"
+if [ -z "${PI_HOST:-}" ]; then
+    echo "set PI_HOST to the target's address, e.g. PI_HOST=10.0.0.5 $0" >&2
+    exit 2
+fi
 PI_USER="${PI_USER:-alarm}"
 PI_PASS="${PI_PASS:-alarm}"
 

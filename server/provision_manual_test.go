@@ -3,7 +3,7 @@ package main
 // Manual, hardware-in-the-loop check of the su-over-pty bootstrap against a
 // real Arch Linux ARM box. Does NOT run the destructive provisioning steps.
 // Run with:
-//   LC3_MANUAL_HOST=192.168.1.146 LC3_MANUAL_USER=alarm \
+//   LC3_MANUAL_HOST=10.0.0.5 LC3_MANUAL_USER=alarm \
 //   LC3_MANUAL_PW=alarm LC3_MANUAL_ROOTPW=root \
 //   go test -run TestSuBootstrapManual -v ./...
 // Skipped automatically when LC3_MANUAL_HOST is unset.

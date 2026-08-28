@@ -41,12 +41,12 @@ Then, in balenaCloud, open the fleet, go to **Variables**, and add:
 
 | Variable | Value |
 | --- | --- |
-| `LC3_GATEWAY` | the gateway's LAN IP, e.g. `192.168.1.146` |
+| `LC3_GATEWAY` | the gateway's LAN IP, e.g. `10.0.0.5` |
 | `LC3_WORKER_TOKEN` | the token printed above |
 
 Or from the CLI:
 
-    balena env set LC3_GATEWAY 192.168.1.146 --fleet lc3-workers
+    balena env set LC3_GATEWAY 10.0.0.5 --fleet lc3-workers
     balena env set LC3_WORKER_TOKEN "<token>" --fleet lc3-workers
 
 `balena/set-vars.sh` does both in one step. A wrong token is rejected by the

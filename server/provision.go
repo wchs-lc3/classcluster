@@ -237,13 +237,27 @@ func firstN(s string, n int) string {
 }
 
 // gatewayIPToward finds the local address a given worker will reach us at.
+// LC3_GATEWAY_IP overrides it, for a gateway behind NAT or on more than one
+// network, where the address a worker should use is not one we can infer.
 func gatewayIPToward(host string) string {
-	conn, err := net.Dial("udp", host+":9")
-	if err != nil {
-		return "192.168.1.146"
+	if ip := strings.TrimSpace(os.Getenv("LC3_GATEWAY_IP")); ip != "" {
+		return ip
 	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	if conn, err := net.Dial("udp", host+":9"); err == nil {
+		defer conn.Close()
+		return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	}
+	// No route to that worker yet. Fall back to this machine's own address
+	// rather than a guess: a wrong address here sends the worker's heartbeats
+	// to a stranger, and the worker never appears in the admin view.
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && !n.IP.IsLoopback() && n.IP.To4() != nil {
+				return n.IP.String()
+			}
+		}
+	}
+	return ""
 }
 
 func ProvisionWorker(id, host, user, password, rootPassword string) error {
@@ -318,7 +332,12 @@ func ProvisionWorker(id, host, user, password, rootPassword string) error {
 	if err := sh.pushFile("/opt/lc3/worker/runner.py", "/opt/lc3/runner.py", "644"); err != nil {
 		return err
 	}
-	runnerUnit := runnerUnitFor(gatewayIPToward(host), id, workerToken())
+	gw := gatewayIPToward(host)
+	if gw == "" {
+		return fmt.Errorf("cannot work out the address this worker should reach " +
+			"the gateway at; set LC3_GATEWAY_IP")
+	}
+	runnerUnit := runnerUnitFor(gw, id, workerToken())
 	if err := sh.push([]byte(runnerUnit), "/etc/systemd/system/lc3-runner.service", "644"); err != nil {
 		return err
 	}
@@ -334,7 +353,6 @@ func ProvisionWorker(id, host, user, password, rootPassword string) error {
 
 	// --- heavy asset mirror ---
 	note("mirroring static assets (may take a while)")
-	gw := gatewayIPToward(host)
 	mirror := "mkdir -p /srv/lc3-cdn && cd /srv/lc3-cdn && " +
 		"curl -s --fail http://" + gw + "/heavy-manifest.txt -o /tmp/lc3-manifest.txt && " +
 		"while read -r f; do mkdir -p \"$(dirname \"$f\")\"; " +

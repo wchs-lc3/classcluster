@@ -134,42 +134,6 @@ and by the container's `mem_limit`.
 (`mem_limit`, `pids_limit`, `tmpfs` size) are in `docker-compose.yml`, since
 Docker resource limits are fixed at deploy time and cannot come from a variable.
 
-## Optional: SOCKS5 egress via the VPN box (`egress-proxy`)
-
-`egress-proxy` is a third service, idle by default. When enabled it runs
-xray-core as a trojan+TLS client, dialing out to a VPN box and exposing a
-plain SOCKS5 proxy on the device's own loopback (`127.0.0.1:1080` by
-default). Once that's listening, it PATCHes balenaOS's own host proxy to
-point at itself via the local Supervisor API (`BALENA_SUPERVISOR_ADDRESS` /
-`BALENA_SUPERVISOR_API_KEY`, injected by the `io.balena.features.supervisor-api`
-label on this service) — so the supervisor's own connection to balenaCloud
-routes through the tunnel too, not just other containers' traffic. This is
-done locally, on the device, deliberately: configuring it from the
-balenaCloud dashboard/CLI would need a working balenaCloud connection in the
-first place, which is exactly what a flaky network makes unavailable.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `LC3_EGRESS_ENABLE` | `0` | Set `1` to run the tunnel; otherwise the service idles doing nothing. |
-| `LC3_EGRESS_SERVER` | `54.210.85.169` | The trojan server's **IP**, not its hostname. A balena device only has whatever DNS the classroom LAN hands it, so resolving `vpn.cheesle.com` there is one more silent failure mode; connecting by IP avoids it. |
-| `LC3_EGRESS_SNI` | `vpn.cheesle.com` | The cert's hostname. TLS validates against this even though the connection dials the IP above — never point it at an IP or the handshake fails. |
-| `LC3_EGRESS_PASSWORD` | *(empty, required)* | The trojan client password from the server's `inbounds[0].settings.clients[].password`. **Must be a client dedicated to this fleet** (its own password/email), never one shared with a personal device — if the VPN box's routing restricts LAN access by client identity (`user` in a routing rule matched against the client email), a shared password bypasses that restriction entirely for whichever client uses it. Set as a fleet/device variable, never baked into the image. |
-| `LC3_EGRESS_SERVER_PORT` | `443` | Trojan server port. |
-| `LC3_EGRESS_ALPN` | `http/1.1` | Must match the server's `tlsSettings.alpn`. |
-| `LC3_EGRESS_SOCKS_PORT` | `1080` | Local SOCKS5 port on the device's loopback. |
-| `LC3_EGRESS_SET_HOST_PROXY` | `1` | Set `0` to skip the self-PATCH and leave the host proxy alone (e.g. to configure it manually, or during testing). |
-
-Enable it:
-
-    balena env set LC3_EGRESS_ENABLE 1 --fleet lc3-workers
-    balena env set LC3_EGRESS_PASSWORD "<trojan client password>" --fleet lc3-workers
-
-Only override `LC3_EGRESS_SERVER` / `LC3_EGRESS_SNI` if the VPN box's IP or
-hostname changes from the defaults baked into the image.
-
-`balena logs <uuid> --service egress-proxy` shows the tunnel target, whether
-xray started cleanly, and whether the host-proxy PATCH succeeded.
-
 ## Operating notes
 
 - **Egress lockdown is not reproduced here, and should not be.** The Arch
@@ -186,13 +150,3 @@ xray started cleanly, and whether the host-proxy PATCH succeeded.
 - **Removing a device** from the fleet leaves its last row in the gateway's
   worker list; it goes to `down` when the heartbeats stop, and the teacher's
   admin view can delete it.
-- **Whoever hosts the VPN box for `egress-proxy` must isolate this fleet's
-  traffic from anything else that box can reach.** Give the fleet its own
-  trojan client (its own password/email) and, if the box shares a network
-  with other things worth protecting (e.g. it's a home server, not an
-  isolated cloud box), add a routing rule blocking that client's access to
-  private IP ranges — an xray/v2ray rule like `{"type":"field","user":
-  ["<fleet client email>"],"ip":["geoip:private"],"outboundTag":"<blackhole
-  tag>"}` does this without affecting any other client on the same box.
-  Never apply that block server-wide if the box also serves personal
-  traffic that needs real LAN access.

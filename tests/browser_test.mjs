@@ -204,7 +204,24 @@ try {
       () => /TERMINAL_42/.test([...document.querySelectorAll('.xterm-rows')].map(x => x.innerText).join(' ')),
       { timeout: 60000 });
     ok('Run command runs the file and shows output in the integrated terminal');
+    // The header is written before the workbench has opened the pseudoterminal,
+    // so on the very first Run it is the part that goes missing.
+    const firstRun = await page.evaluate(() =>
+      [...document.querySelectorAll('.xterm-rows')].map(x => x.innerText).join(' '));
+    if (/\$ run rundemo\.py/.test(firstRun)) ok('the first Run shows its whole header, not just the output');
+    else bad('the first Run dropped its "$ run rundemo.py" header');
   } catch (e) { bad('terminal run failed: ' + e.message); }
+
+  // --- trashing the terminal must not disable Run ---
+  try {
+    await paletteRun(page, 'Terminal: Kill the Active Terminal Instance');
+    await new Promise(r => setTimeout(r, 2500));
+    await paletteRun(page, 'LC3: Run Program');
+    await page.waitForFunction(
+      () => /TERMINAL_42/.test([...document.querySelectorAll('.xterm-rows')].map(x => x.innerText).join(' ')),
+      { timeout: 60000 });
+    ok('Run builds a new terminal after the old one is trashed');
+  } catch (e) { bad('Run did not recover from a trashed terminal: ' + e.message); }
 
   // --- Python interactive input via the terminal (prompt + typed input) ---
   try {

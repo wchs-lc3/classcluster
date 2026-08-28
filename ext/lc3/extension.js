@@ -105,11 +105,32 @@ class RunTerminal {
     this.mode = 'idle';        // idle | run (python) | exec (cluster JVM)
     this.runId = null;         // python run id for the stdin relay
     this.execRun = null;       // cluster run id for interactive input
+    // A pseudoterminal only starts receiving onDidWrite once the workbench has
+    // opened it, which happens a tick or two after createTerminal. The first
+    // Run writes its header before that, so hold output until open().
+    this.opened = false;
+    this.pending = [];
   }
-  open() { this.raw('\x1b[2mLC3 terminal. Open a file and press Run (F5).\x1b[0m\r\n'); }
-  close() {}
-  raw(text) { this.writeEmitter.fire(text); }
-  write(text) { this.writeEmitter.fire(String(text).replace(/\r?\n/g, '\r\n')); }
+  open() {
+    this.opened = true;
+    // The hint is only useful when nothing is waiting to be shown; on the first
+    // Run the student wants their program's output, not instructions.
+    if (!this.pending.length) {
+      this.raw('\x1b[2mLC3 terminal. Open a file and press Run (F5).\x1b[0m\r\n');
+      return;
+    }
+    const queued = this.pending;
+    this.pending = [];
+    for (const text of queued) this.writeEmitter.fire(text);
+  }
+  // Closing the terminal ends whatever it was running; nothing is left to read
+  // the program's output or feed it stdin.
+  close() { stopRun(this); }
+  raw(text) {
+    if (!this.opened) { this.pending.push(text); return; }
+    this.writeEmitter.fire(text);
+  }
+  write(text) { this.raw(String(text).replace(/\r?\n/g, '\r\n')); }
   dim(text) { this.raw('\x1b[2m' + text + '\x1b[0m\r\n'); }
 
   handleInput(data) {
@@ -147,19 +168,135 @@ function getTerminal() {
   return { ui: term, pty: termInstance };
 }
 
-function stopActiveRun() {
-  if (!termInstance) return;
-  if (termInstance.execRun) {
-    req('POST', '/api/run/exec/kill?run=' + encodeURIComponent(termInstance.execRun));
-    termInstance.execRun = null;
+// Trashing the terminal disposes it for good, so drop the cached reference:
+// otherwise the next Run shows a dead terminal and its output goes nowhere.
+function forgetTerminal(closed) {
+  if (closed && closed !== term) return;
+  term = null;
+  termInstance = null;
+}
+
+function stopRun(pty) {
+  if (!pty) return;
+  if (pty.execRun) {
+    req('POST', '/api/run/exec/kill?run=' + encodeURIComponent(pty.execRun));
+    pty.execRun = null;
   }
-  if (termInstance.runId) {
-    req('POST', '/api/run/stdin?run=' + encodeURIComponent(termInstance.runId) + '&end=1');
+  if (pty.runId) {
+    req('POST', '/api/run/stdin?run=' + encodeURIComponent(pty.runId) + '&end=1');
     if (bc) bc.postMessage({ t: 'stop' }); // kill the Python worker (e.g. infinite loop)
-    termInstance.runId = null;
+    pty.runId = null;
   }
-  termInstance.mode = 'idle';
-  termInstance.line = '';
+  pty.mode = 'idle';
+  pty.line = '';
+}
+
+function stopActiveRun() { stopRun(termInstance); }
+
+/* ---------------------------- worker shell ------------------------------- */
+// A real terminal on a worker, for a teacher diagnosing a node that is acting
+// up. Unlike the Run terminal this one is raw: every keystroke goes to the
+// worker's pty as-is, so Ctrl+C, tab completion, and full-screen programs work.
+
+function b64ToBytes(s) {
+  const bin = atob(s || '');
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+class ShellTerminal {
+  constructor(host) {
+    this.host = host;
+    this.writeEmitter = new vscode.EventEmitter();
+    this.onDidWrite = this.writeEmitter.event;
+    this.closeEmitter = new vscode.EventEmitter();
+    this.onDidClose = this.closeEmitter.event;
+    this.run = null;
+    this.rows = 24;
+    this.cols = 80;
+    this.alive = false;
+    // Output arrives in arbitrary chunks, so a multi-byte character can be
+    // split across two polls; a streaming decoder stitches those back together.
+    this.decoder = new TextDecoder('utf-8');
+  }
+
+  async open(dims) {
+    if (dims) { this.rows = dims.rows || 24; this.cols = dims.columns || 80; }
+    this.writeEmitter.fire('\x1b[2mconnecting to ' + this.host + '...\x1b[0m\r\n');
+    let resp;
+    try {
+      resp = await req('POST', '/api/admin/shell/start',
+        { host: this.host, rows: this.rows, cols: this.cols });
+    } catch (e) { this.fail('could not reach the gateway'); return; }
+    if (!resp.ok) {
+      let d = ''; try { d = (await resp.json()).detail; } catch (e) {}
+      this.fail(d || ('gateway returned ' + resp.status)); return;
+    }
+    const r = await resp.json();
+    if (r.status === 'busy') { this.fail('this worker already has the most shells it allows'); return; }
+    if (r.status !== 'running') { this.fail('the worker could not start a shell'); return; }
+    this.run = r.run;
+    this.alive = true;
+    this.pump();
+  }
+
+  fail(message) {
+    this.writeEmitter.fire('\x1b[31m' + message + '\x1b[0m\r\n');
+    this.closeEmitter.fire(1);
+  }
+
+  async pump() {
+    let since = 0;
+    while (this.alive && this.run) {
+      let resp;
+      try {
+        resp = await req('GET', '/api/admin/shell/output?run=' +
+          encodeURIComponent(this.run) + '&since=' + since);
+      } catch (e) { this.fail('[lost connection to ' + this.host + ']'); return; }
+      if (!resp.ok) { this.fail('[worker stopped responding]'); return; }
+      const j = await resp.json();
+      if (j.data) {
+        this.writeEmitter.fire(this.decoder.decode(b64ToBytes(j.data), { stream: true }));
+      }
+      since = j.next;
+      if (j.done) {
+        this.alive = false; this.run = null;
+        this.writeEmitter.fire('\r\n\x1b[2m[shell closed, exit code ' + j.exit + ']\x1b[0m\r\n');
+        this.closeEmitter.fire(j.exit);
+        return;
+      }
+    }
+  }
+
+  handleInput(data) {
+    if (!this.run) return;
+    req('POST', '/api/admin/shell/input?run=' + encodeURIComponent(this.run),
+      { data: bytesToB64(new TextEncoder().encode(data)) });
+  }
+
+  setDimensions(dims) {
+    if (!dims) return;
+    this.rows = dims.rows; this.cols = dims.columns;
+    if (!this.run) return;
+    req('POST', '/api/admin/shell/resize?run=' + encodeURIComponent(this.run),
+      { rows: this.rows, cols: this.cols });
+  }
+
+  close() {
+    this.alive = false;
+    if (this.run) {
+      req('POST', '/api/admin/shell/kill?run=' + encodeURIComponent(this.run));
+      this.run = null;
+    }
+  }
+}
+
+function openWorkerShell(host, label) {
+  const pty = new ShellTerminal(host);
+  const t = vscode.window.createTerminal({ name: 'worker ' + (label || host), pty });
+  t.show();
+  return t;
 }
 
 /* ---------------------------- run controller ----------------------------- */
@@ -288,13 +425,20 @@ async function submitCommand() {
   const assignment = path.split('/').filter(Boolean)[0];
   if (!assignment) { vscode.window.showWarningMessage('Put your work in an assignment folder before submitting.'); return; }
   await vscode.workspace.saveAll(false);
-  const pick = await vscode.window.showWarningMessage(
-    'Submit "' + assignment + '" for grading?', { modal: true }, 'Submit');
-  if (pick !== 'Submit') return;
+  const pick = me.role === 'teacher'
+    ? await vscode.window.showInformationMessage(
+      'Run "' + assignment + '" through grading the way a student would? ' +
+      'The starter is graded against the tests, and nothing is recorded.',
+      { modal: true }, 'Run tests')
+    : await vscode.window.showWarningMessage(
+      'Submit "' + assignment + '" for grading?', { modal: true }, 'Submit');
+  if (pick !== 'Submit' && pick !== 'Run tests') return;
 
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: 'Grading ' + assignment + '...' },
     async () => {
+      // For a teacher this is the same grading path a student's submission
+      // takes, over the starter they publish; it just is not recorded.
       let resp;
       try { resp = await req('POST', '/api/submit', { assignment }); }
       catch (e) { vscode.window.showErrorMessage('Could not reach the grader.'); return; }
@@ -307,14 +451,16 @@ async function submitCommand() {
       const { ui, pty } = getTerminal();
       ui.show(true);
       pty.raw('\r\n\x1b[1m$ submit ' + assignment + '\x1b[0m\r\n');
+      if (r.dry_run) pty.dim('grading the starter against the tests, as a student would; not recorded');
       for (const t of r.tests) {
         pty.raw((t.passed ? '\x1b[32m  PASS  \x1b[0m' : '\x1b[31m  FAIL  \x1b[0m') + t.name + '\r\n');
       }
       pty.dim('result: ' + r.passed + ' passed, ' + r.failed + ' failed  (status: ' + r.status + ')');
+      const whose = r.dry_run ? 'the starter' : 'your code';
       if (r.status === 'compile_error') {
-        vscode.window.showErrorMessage(assignment + ': your code does not compile. Use Run to see details.');
+        vscode.window.showErrorMessage(assignment + ': ' + whose + ' does not compile. Use Run to see details.');
       } else if (r.status === 'timeout') {
-        vscode.window.showErrorMessage(assignment + ': your code ran too long (infinite loop?).');
+        vscode.window.showErrorMessage(assignment + ': ' + whose + ' ran too long (infinite loop?).');
       } else if (r.failed === 0 && r.passed > 0) {
         vscode.window.showInformationMessage(assignment + ': all ' + r.passed + ' tests passed!');
       } else {
@@ -347,10 +493,11 @@ function applyDiags(path, diags) {
 
 function onRuntimeMessage(ev) {
   const m = ev.data || {};
-  // Program output lands in the terminal. Ensure it exists (a message can arrive
-  // before the terminal reference is cached) and match it to the active run.
+  // Program output lands in the terminal. If the student trashed it the run was
+  // stopped with it, so late messages are dropped rather than resurrecting it.
   if (m.t === 'out' || m.t === 'status' || m.t === 'exit') {
-    const t = getTerminal().pty;
+    const t = termInstance;
+    if (!t) return;
     if (t.runId && m.runId && t.runId !== m.runId) return; // a stale/other run
     if (m.t === 'out') {
       t.write(m.data);
@@ -392,6 +539,43 @@ async function postJSON(path, body) {
   return j;
 }
 function adminError(e) { vscode.window.showErrorMessage('LC3: ' + ((e && e.message) || e)); }
+
+// How busy a node is, in the one line the tree has room for: the runs it is
+// carrying out of the runs it accepts, then the machine's own load.
+function workerSummary(w) {
+  const l = w.load || {};
+  if (w.status === 'provisioning') return 'provisioning';
+  if (!l.reachable) return w.status + '  ·  no load report';
+  const parts = [w.status, 'runs ' + (l.runs || 0) + '/' + (l.max_runs || 0)];
+  if (l.grades) parts.push('grading ' + l.grades);
+  if (l.shells) parts.push('shells ' + l.shells);
+  const avg = (l.loadavg || [])[0];
+  if (avg !== undefined) {
+    // Load is per-core on the machine reporting it; a Pi 3 has 4, the Pi 4 has 4.
+    parts.push('cpu ' + Math.round((avg / Math.max(1, l.cpus || 1)) * 100) + '%');
+  }
+  if (l.mem_total_mb) parts.push((l.mem_avail_mb || 0) + ' MB free');
+  return parts.join('  ·  ');
+}
+
+function workerDetail(w) {
+  const l = w.load || {};
+  const lines = ['**' + w.host + '**' + (w.local ? ' (gateway)' : ''), '', 'status: ' + w.status];
+  if (w.note) lines.push('note: ' + w.note);
+  if (!l.reachable) {
+    lines.push('', 'The runner on this node did not answer, so there is no load to show.');
+    return lines.join('\n\n');
+  }
+  lines.push('interactive runs: ' + (l.runs || 0) + ' of ' + (l.max_runs || 0) +
+    ' (' + (l.dispatched || 0) + ' routed from this gateway)');
+  lines.push('grading: ' + (l.grades || 0) + ' of ' + (l.max_grades || 0) +
+    ' (' + (l.grading || 0) + ' sent from this gateway)');
+  lines.push('load average: ' + (l.loadavg || []).join(', ') + ' over ' + (l.cpus || 1) + ' cpus');
+  lines.push('memory: ' + (l.mem_avail_mb || 0) + ' MB free of ' + (l.mem_total_mb || 0) + ' MB');
+  lines.push('java: ' + (l.java ? 'installed' : 'missing'));
+  lines.push('shell: ' + (l.shell_available ? 'available' : 'not configured on this node'));
+  return lines.join('\n\n');
+}
 
 function sectionItem(label, ctx, icon) {
   const it = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.Collapsed);
@@ -452,10 +636,11 @@ class AdminTree {
         const j = await getJSON('/api/admin/workers');
         return (j.workers || []).map((w) => {
           const it = new vscode.TreeItem(w.host + (w.local ? '  (gateway)' : ''));
-          it.description = w.status; it.contextValue = w.local ? 'worker.local' : 'worker'; it.lc3 = w;
+          it.description = workerSummary(w);
+          it.contextValue = w.local ? 'worker.local' : 'worker'; it.lc3 = w;
           it.iconPath = new vscode.ThemeIcon(
             w.status === 'up' ? 'pass' : (w.status === 'error' ? 'error' : 'circle-slash'));
-          it.tooltip = w.note || '';
+          it.tooltip = new vscode.MarkdownString(workerDetail(w));
           return it;
         });
       }
@@ -748,6 +933,42 @@ function registerAdmin(context) {
       const host = item && item.lc3 && item.lc3.host; if (!host) return;
       if (!await confirmModal('Remove worker "' + host + '"?')) return;
       try { await postJSON('/api/admin/workers/delete', { host }); adminTree.refresh(); } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.workerTerminal', async (item) => {
+      const w = (item && item.lc3) || {};
+      if (!w.host) return;
+      if (w.load && w.load.reachable && !w.load.shell_available) {
+        vscode.window.showWarningMessage(
+          'LC3: ' + w.host + ' has no shell. Set LC3_SHELL_TOKEN on that node and on the gateway.');
+        return;
+      }
+      openWorkerShell(w.host, w.local ? 'gateway' : w.host);
+    }),
+
+    vscode.commands.registerCommand('lc3.newAssignment', async () => {
+      try {
+        const lang = await vscode.window.showQuickPick(['python', 'java'],
+          { placeHolder: 'Language for the new assignment' });
+        if (!lang) return;
+        const folder = await vscode.window.showInputBox({
+          prompt: 'Folder name in your files (letters, numbers, - or _)',
+          placeHolder: 'unit3-cart' });
+        if (!folder) return;
+        const title = await vscode.window.showInputBox({
+          prompt: 'Title students see', value: folder });
+        if (title === undefined) return;
+        const j = await postJSON('/api/admin/assignments/template',
+          { folder: folder.trim(), language: lang, title });
+        await vscode.commands.executeCommand('workbench.files.action.refreshFilesExplorer');
+        // Open the starter so the teacher lands on the file they will edit.
+        const uri = vscode.Uri.from({ scheme: 'lc3', path: '/' + j.folder + '/starter/' + j.entry });
+        try {
+          await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri));
+        } catch (e) { /* the tree refresh is enough */ }
+        vscode.window.showInformationMessage(
+          'LC3: created "' + j.folder + '". Press Submit to run it the way a student would, ' +
+          'then publish it with Create Assignment from Folder.');
+      } catch (e) { adminError(e); }
     }));
 
   // Refresh the workers and submissions view periodically.
@@ -807,6 +1028,10 @@ async function activate(context) {
     bc.onmessage = onRuntimeMessage;
     context.subscriptions.push(new vscode.Disposable(() => bc.close()));
   }
+
+  // Let Run build a fresh terminal after the student trashes the old one.
+  context.subscriptions.push(
+    vscode.window.onDidCloseTerminal((closed) => forgetTerminal(closed)));
 
   context.subscriptions.push(
     vscode.commands.registerCommand('lc3.run', runCommand),

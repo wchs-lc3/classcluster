@@ -7,6 +7,9 @@ ExecStart=/usr/bin/python /opt/lc3/worker/runner.py
 Restart=always
 RestartSec=3
 Environment=LC3_RUNNER_BIND=127.0.0.1
+# Must match LC3_SHELL_TOKEN on the gateway for the teacher's worker shell.
+# Unset means this node serves no shell endpoint.
+#Environment=LC3_SHELL_TOKEN=
 
 [Install]
 WantedBy=multi-user.target

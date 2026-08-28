@@ -60,11 +60,39 @@ assignment can be published to several classes of the same language at once.
   assignment's `starter/` and `tests/` in their own files, and turn that folder
   into a published assignment without any external zip tool (or upload a zip).
   Assignments can be deleted, and student passwords reset, from the same view.
+- Start from a working assignment: New Assignment from Template drops a small
+  assignment into the teacher's files that already passes, with the starter
+  students receive, the private tests, and a worked answer to check them
+  against. Editing something that runs beats filling in an empty folder.
+- Rehearse before publishing: a teacher pressing Submit runs the starter against
+  the tests through the same grading path a student's submission takes, on the
+  same workers, so what they see is what the class will see. A teacher's run is
+  not recorded as a grade.
 - Cluster distribution: grading and interactive runs go to the Pi 3 workers
   first; the gateway's own runner is used last. Adding a Pi 3 from the admin
   view provisions it over SSH and expands the pool; a Pi flashed with the
   balenaOS worker image joins on its own instead, and is configured from the
   balenaCloud dashboard (`balena/README.md`).
+- See what each node is carrying: the Workers section lists every node with the
+  runs it is holding out of the runs it accepts, its CPU load, and its free
+  memory, so a class that has gone slow can be traced to the node causing it.
+- A shell on a worker, for when the numbers are not enough. The teacher opens a
+  terminal on any node from the Workers section and gets a real login shell
+  there. It is off until a shell token is configured; see below.
+
+## Turning on the worker shell
+
+The shell gives a teacher root on the node they open it on, so it does not exist
+until you decide it should. Set `LC3_SHELL_TOKEN` to the same value on the
+gateway and on every node you want reachable, and restart them. A node without
+the variable has no shell endpoint at all, and the Workers section says so.
+
+On the gateway and a provisioned Pi 3 the variable goes in the systemd unit
+(`deploy/lc3-api.service`, `deploy/lc3-runner.service`); on a balena worker it is
+a fleet or device variable in the balenaCloud dashboard.
+
+Only signed-in teachers can reach it, and only for nodes the gateway already
+knows. Leave it unset if you do not want it.
 
 ## Known limitations
 
@@ -79,6 +107,9 @@ assignment can be published to several classes of the same language at once.
   the test source blocks reading it from disk, but a very advanced student could
   still introspect in-memory objects; closing that fully needs out-of-process
   grading, which this does not do.
+- The worker shell is a plain root shell, not a restricted one, and it is not
+  sandboxed; a shell that could not see the service logs would not answer the
+  question it was opened to answer. It is off unless you configure a token.
 
 ## Layout
 

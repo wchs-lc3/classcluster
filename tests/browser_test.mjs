@@ -3,9 +3,35 @@
 // student's files load, drives the hidden runtime over the same BroadcastChannel
 // the extension uses (so real Pyodide output is exercised), and checks that the
 // LC3 extension activated. Uses system Chrome via puppeteer-core.
-import puppeteer from '/Storage/claude-tmp/claude-1000/-home-artur-classcluster/82aa4bb4-637e-415e-9e26-3c8b604b7896/scratchpad/node_modules/puppeteer-core/lib/puppeteer/puppeteer-core.js';
+//
+//   npm i puppeteer-core          # anywhere node will resolve it from
+//   node tests/browser_test.mjs http://<gateway>
+//
+// PUPPETEER_CORE overrides where puppeteer-core is loaded from, and CHROME
+// which browser binary it drives.
+import { readFileSync, existsSync } from 'node:fs';
 
-import { readFileSync } from 'node:fs';
+const puppeteer = await (async () => {
+  const tried = [];
+  for (const spec of [process.env.PUPPETEER_CORE, 'puppeteer-core', 'puppeteer']) {
+    if (!spec) continue;
+    try { return (await import(spec)).default; } catch (e) { tried.push(spec); }
+  }
+  console.error('could not load puppeteer-core (tried: ' + tried.join(', ') + ').\n' +
+    'Install it with "npm i puppeteer-core", or point PUPPETEER_CORE at a copy.');
+  process.exit(2);
+})();
+
+// System Chrome, wherever this machine keeps it.
+function findChrome() {
+  const candidates = [process.env.CHROME,
+    '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/opt/google/chrome/chrome',
+    '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'];
+  for (const p of candidates) if (p && existsSync(p)) return p;
+  console.error('no Chrome found. Install one, or point CHROME at the binary.');
+  process.exit(2);
+}
 
 const BASE = process.argv[2] || 'http://192.168.1.146';
 let pass = 0, fail = 0;
@@ -65,7 +91,7 @@ async function bootstrap() {
 await bootstrap();
 
 const browser = await puppeteer.launch({
-  executablePath: '/usr/bin/google-chrome-stable',
+  executablePath: findChrome(),
   headless: 'new',
   acceptInsecureCerts: true,
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],

@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 # Python/Java grammars).
 KEEP="theme-defaults python java json markdown-basics configuration-editing"
 
-( cd server && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags='-s -w' -o ../deploy/lc3d . )
+( cd server && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o ../deploy/lc3d . )
 
 $SSH $PI 'mkdir -p /opt/lc3'
 tar czf - server worker ext web deploy examples README.md | $SSH $PI 'tar xzf - -C /opt/lc3'

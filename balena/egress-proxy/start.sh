@@ -106,6 +106,18 @@ set_host_proxy() {
     # release that just started this container, so the very first attempt
     # right after boot routinely 423s. That's not a real failure — it clears
     # itself once the apply finishes — so retry instead of giving up once.
+    #
+    # A 423 that never clears is a different problem: balenaOS's newer
+    # core-next supervisor component can get stuck retrying a target release
+    # it already failed to validate, forever, without ever re-polling for a
+    # newer one — starving every supervisor operation (this PATCH included)
+    # of the lock it needs. force:true does not help; it's not a normal
+    # update lock. The only known way to unstick it is a full device reboot,
+    # which is also a pure local call (no balenaCloud connectivity needed)
+    # and safe to fire once here: after reboot the supervisor restarts clean
+    # and re-fetches target state from scratch.
+    FAILURES=0
+    STUCK_THRESHOLD="${LC3_EGRESS_STUCK_REBOOT_AFTER:-20}"
     while true; do
         HTTP_CODE=$(curl -s -o /tmp/host-config-response -w "%{http_code}" \
             -X PATCH "${BALENA_SUPERVISOR_ADDRESS}/v1/device/host-config?apikey=${BALENA_SUPERVISOR_API_KEY}" \
@@ -115,7 +127,16 @@ set_host_proxy() {
             echo "[lc3-egress] host proxy set: socks5 127.0.0.1:${SOCKS_PORT} — balenaCloud's own connection now routes through the tunnel"
             return
         fi
-        echo "[lc3-egress] host proxy PATCH failed (HTTP ${HTTP_CODE}): $(cat /tmp/host-config-response); retrying in 15s"
+        FAILURES=$((FAILURES + 1))
+        echo "[lc3-egress] host proxy PATCH failed (HTTP ${HTTP_CODE}, attempt ${FAILURES}/${STUCK_THRESHOLD}): $(cat /tmp/host-config-response); retrying in 15s"
+        if [ "$HTTP_CODE" = "423" ] && [ "$FAILURES" -ge "$STUCK_THRESHOLD" ]; then
+            echo "[lc3-egress] host-config has been locked for ${STUCK_THRESHOLD} straight attempts (~$((STUCK_THRESHOLD * 15))s) — this looks like a stuck supervisor, not a normal apply-in-progress lock. Rebooting once to force a clean restart."
+            curl -s -X POST "${BALENA_SUPERVISOR_ADDRESS}/v1/reboot?apikey=${BALENA_SUPERVISOR_API_KEY}" \
+                -H "Content-Type: application/json" -d '{"force":true}'
+            # The device is rebooting; nothing more to do in this run.
+            sleep 300
+            FAILURES=0
+        fi
         sleep 15
     done
 }

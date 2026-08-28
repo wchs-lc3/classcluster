@@ -63,7 +63,7 @@ ENV LC3_SANDBOX_ROBINDS=""
 # because its absence is what keeps the shell endpoints from existing at all.
 ENV LC3_SHELL="/bin/bash"
 ENV LC3_MAX_SHELLS="2"
-ENV LC3_SHELL_IDLE_SEC="1800"
+ENV LC3_SHELL_IDLE_SEC="300"
 
 # --- capacity ---
 ENV LC3_MAX_RUNS=""

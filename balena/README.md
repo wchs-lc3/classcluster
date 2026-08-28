@@ -98,7 +98,7 @@ filesystem, not the host's.
 | `LC3_SHELL_TOKEN` | *(empty)* | Shared secret with the gateway. Empty means no shell on this device. |
 | `LC3_SHELL` | `/bin/bash` | The shell to start. |
 | `LC3_MAX_SHELLS` | `2` | Shells open at once on this device. |
-| `LC3_SHELL_IDLE_SEC` | `1800` | Close a shell nobody has read from for this long, so a closed browser tab does not leave one running. |
+| `LC3_SHELL_IDLE_SEC` | `300` | Close a shell nobody has read from for this long. A live terminal polls every 25s, so this only ever catches an abandoned tab. |
 
 ### Capacity (`runner`)
 

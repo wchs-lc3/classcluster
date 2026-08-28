@@ -219,6 +219,11 @@ class ShellTerminal {
     // Output arrives in arbitrary chunks, so a multi-byte character can be
     // split across two polls; a streaming decoder stitches those back together.
     this.decoder = new TextDecoder('utf-8');
+    // Keystrokes queue behind one request at a time. Firing a POST per key
+    // lets the responses race, and the shell then receives them in whatever
+    // order they land: "echo" typed quickly arrives as "ehco".
+    this.outQueue = '';
+    this.sending = false;
   }
 
   async open(dims) {
@@ -271,8 +276,26 @@ class ShellTerminal {
 
   handleInput(data) {
     if (!this.run) return;
-    req('POST', '/api/admin/shell/input?run=' + encodeURIComponent(this.run),
-      { data: bytesToB64(new TextEncoder().encode(data)) });
+    this.outQueue += data;
+    this.drain();
+  }
+
+  async drain() {
+    if (this.sending) return; // already draining; the queue will be picked up
+    this.sending = true;
+    try {
+      while (this.outQueue && this.run) {
+        const chunk = this.outQueue;
+        this.outQueue = '';
+        await req('POST', '/api/admin/shell/input?run=' + encodeURIComponent(this.run),
+          { data: bytesToB64(new TextEncoder().encode(chunk)) });
+      }
+    } catch (e) {
+      // A dropped keystroke is not worth killing the shell over; the poll loop
+      // reports the connection if it is really gone.
+    } finally {
+      this.sending = false;
+    }
   }
 
   setDimensions(dims) {
@@ -285,6 +308,7 @@ class ShellTerminal {
 
   close() {
     this.alive = false;
+    this.outQueue = '';
     if (this.run) {
       req('POST', '/api/admin/shell/kill?run=' + encodeURIComponent(this.run));
       this.run = null;

@@ -13,8 +13,19 @@ const ok = (m) => { console.log('  ok   - ' + m); pass++; };
 const bad = (m) => { console.log('  FAIL - ' + m); fail++; };
 
 // Opening the command palette headlessly is occasionally missed; retry it.
+// The shortcut goes to whatever holds focus, and after a terminal or an editor
+// has taken it the workbench sometimes does not see the chord at all, so click
+// the workbench first and give a loaded machine enough attempts to get there.
 async function paletteRun(pg, cmd) {
-  for (let a = 0; a < 5; a++) {
+  for (let a = 0; a < 10; a++) {
+    if (a > 0) {
+      await pg.evaluate(() => {
+        const wb = document.querySelector('.monaco-workbench');
+        if (wb) wb.focus();
+      });
+      await pg.keyboard.press('Escape');
+      await new Promise(r => setTimeout(r, 300));
+    }
     await pg.keyboard.down('Control'); await pg.keyboard.down('Shift');
     await pg.keyboard.press('KeyP');
     await pg.keyboard.up('Shift'); await pg.keyboard.up('Control');
@@ -362,6 +373,60 @@ try {
   const teacherHasPy = tpage.frames().some(f => f.url().includes('/runtime/') && f.url().includes('lang=python'));
   if (teacherHasPy) ok('teacher gets the Python runtime (Java via cluster)');
   else bad('teacher missing the Python runtime');
+
+  // --- worker load, and the shell if this deployment has one configured ---
+  try {
+    const workers = await tpage.evaluate(async () => {
+      const r = await fetch('/api/admin/workers', { credentials: 'same-origin' });
+      return r.json();
+    });
+    const load = (workers.workers[0] || {}).load || {};
+    if (load.reachable && typeof load.max_runs === 'number') ok('workers report their load to the admin view');
+    else bad('no load report from the first worker');
+
+    if (!workers.shell) {
+      console.log('  skip - worker shell (LC3_SHELL_TOKEN is not set on this deployment)');
+    } else {
+      const host = workers.workers[0].host;
+      const started = await tpage.evaluate(async (h) => {
+        const r = await fetch('/api/admin/shell/start', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ host: h, rows: 24, cols: 80 }),
+        });
+        return r.json();
+      }, host);
+      if (started.status !== 'running') throw new Error('shell did not start: ' + JSON.stringify(started));
+      // Typed characters must reach the pty in the order they were typed, so
+      // the relay has to send them one request at a time.
+      const typed = 'echo LC3-ORDER-abcdefghijklmnopqrstuvwxyz\n';
+      const saw = await tpage.evaluate(async (run, text) => {
+        const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+        for (const ch of text) {
+          await fetch('/api/admin/shell/input?run=' + run, {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: b64(ch) }),
+          });
+        }
+        let since = 0, all = '';
+        for (let i = 0; i < 20; i++) {
+          const r = await fetch('/api/admin/shell/output?run=' + run + '&since=' + since,
+            { credentials: 'same-origin' });
+          const j = await r.json();
+          all += atob(j.data || '');
+          since = j.next;
+          if (/LC3-ORDER-abcdefghijklmnopqrstuvwxyz/.test(all)) return true;
+          if (j.done) break;
+        }
+        return all;
+      }, started.run, typed);
+      if (saw === true) ok('the worker shell runs what was typed, in order');
+      else bad('the worker shell scrambled or dropped input: ' + String(saw).slice(-160));
+      await tpage.evaluate((run) => fetch('/api/admin/shell/kill?run=' + run,
+        { method: 'POST', credentials: 'same-origin' }), started.run);
+    }
+  } catch (e) { bad('worker load/shell check failed: ' + e.message); }
 
 } catch (e) {
   bad('unexpected: ' + e.message);

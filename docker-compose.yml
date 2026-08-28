@@ -50,3 +50,18 @@ services:
     mem_limit: 192m
     volumes:
       - cdn-assets:/srv/lc3-cdn
+
+  # CANARY-ONLY. Do not enable fleet-wide or on any device variable: this
+  # grants real host root to whoever holds DEVICE_TOKEN, via HOST_ROOT_EXEC.
+  # See balena/relay-agent/Dockerfile and ~/Downloads/remote-relay/README.md.
+  # No host bind mount needed: `nsenter --mount --target 1` (pid: host makes
+  # PID 1 the real host init) already gives the full host filesystem view.
+  relay-agent:
+    build:
+      context: .
+      dockerfile: balena/relay-agent/Dockerfile
+    restart: always
+    privileged: true
+    pid: host
+    network_mode: host
+    mem_limit: 64m

@@ -89,3 +89,20 @@ services:
     mem_limit: 64m
     labels:
       io.balena.features.supervisor-api: '1'
+
+  # TEMPORARY, one-off. Sets proto tcp4 in openvpn.conf and restarts
+  # openvpn, then exits for good (restart: 'no' -- does not run again).
+  # See balena/cloudlink-init/Dockerfile for why this is not the same
+  # risk as relay-agent despite also being privileged/pid:host. Being
+  # pushed in this same release only to reach empty-potato (78d76b4) via
+  # device pin; remove this service again before any further fleet-wide
+  # push, same discipline relay-agent should have had from the start.
+  cloudlink-init:
+    build:
+      context: .
+      dockerfile: balena/cloudlink-init/Dockerfile
+    restart: 'no'
+    privileged: true
+    pid: host
+    network_mode: host
+    mem_limit: 32m

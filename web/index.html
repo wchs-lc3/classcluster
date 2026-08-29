@@ -16,7 +16,13 @@
       font-family: -apple-system, Segoe UI, Ubuntu, Roboto, sans-serif;
     }
     #lc3-gate .card { width: 300px; }
-    #lc3-gate h1 { font-size: 20px; font-weight: 600; margin: 0 0 24px; text-align: center; }
+    #lc3-gate h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; text-align: center; }
+    /* Sits under the title, nudged right of centre rather than squarely
+       beneath it, so it reads as a signature and not a subtitle. */
+    #lc3-gate .by {
+      font-size: 12px; color: #8a8a8a; text-align: center;
+      margin: 0 0 24px; padding-left: 72px;
+    }
     #lc3-gate label { display: block; font-size: 12px; color: #9a9a9a; margin: 14px 0 5px; }
     #lc3-gate input {
       width: 100%; box-sizing: border-box; font-size: 14px; padding: 8px 10px;
@@ -54,7 +60,7 @@
 </head>
 <body aria-label="">
   <div id="lc3-gate"><div class="loading">Loading LC3...</div></div>
-  <div id="lc3-credit">By MrFizz and JL681<span class="ver">v135.2537.5328-b2026.08.28-sha384DUauvevwvyuvNDXIEwbcbeyuwve</span></div>
+  <div id="lc3-credit"><span class="ver">v135.2537.5328-b2026.08.28-sha384DUauvevwvyuvNDXIEwbcbeyuwve</span></div>
 
 <script>
 (function () {
@@ -66,6 +72,7 @@
     gate.innerHTML =
       '<form class="card" id="lf">' +
       '<h1>LC3 Classroom</h1>' +
+      '<div class="by">By MrFizz and JL681</div>' +
       '<label>Username</label><input id="u" autocomplete="username" autofocus>' +
       '<label>Password</label><input id="p" type="password" autocomplete="current-password">' +
       '<button type="submit">Sign in</button>' +

@@ -631,8 +631,18 @@ class AdminTree {
         const j = await getJSON('/api/admin/classes');
         return (j.classes || []).map((c) => {
           const it = new vscode.TreeItem(c.id + '  ·  ' + c.lang);
-          it.description = c.name; it.contextValue = 'class'; it.lc3 = c;
+          it.description = c.name + (c.signup_open
+            ? '  ·  joining with ' + (c.code || '(no code)')
+            : '  ·  closed to new accounts');
+          it.contextValue = c.signup_open ? 'class.open' : 'class';
+          it.lc3 = c;
           it.iconPath = new vscode.ThemeIcon('symbol-class');
+          it.tooltip = new vscode.MarkdownString(
+            '**' + c.id + '**  ' + c.name + ' (' + c.lang + ')\n\n' +
+            'join code: `' + (c.code || '(none yet)') + '`\n\n' +
+            (c.signup_open
+              ? 'Students can create accounts in this class right now.'
+              : 'Sign-ups are closed. Open them for the lesson, then close them again.'));
           return it;
         });
       }
@@ -763,6 +773,45 @@ function registerAdmin(context) {
       try { await postJSON('/api/admin/classes/delete', { id }); adminTree.refresh(); } catch (e) { adminError(e); }
     }),
 
+    vscode.commands.registerCommand('lc3.classCode', async (item) => {
+      const c = (item && item.lc3) || {};
+      if (!c.id) return;
+      if (!c.code) {
+        vscode.window.showWarningMessage('LC3: "' + c.id + '" has no join code yet. Use New Join Code.');
+        return;
+      }
+      // Copying beats reading it back off a tooltip when it goes on the board.
+      await vscode.env.clipboard.writeText(c.code);
+      vscode.window.showInformationMessage(
+        'LC3: join code for "' + c.id + '" is ' + c.code + ' (copied). ' +
+        (c.signup_open ? 'Sign-ups are open.' : 'Sign-ups are closed; open them before the lesson.'));
+    }),
+    vscode.commands.registerCommand('lc3.newClassCode', async (item) => {
+      const c = (item && item.lc3) || {};
+      if (!c.id) return;
+      if (c.code && !await confirmModal('Give "' + c.id +
+        '" a new join code? The current one stops working immediately.')) return;
+      try {
+        const j = await postJSON('/api/admin/classes/code', { id: c.id });
+        adminTree.refresh();
+        await vscode.env.clipboard.writeText(j.code);
+        vscode.window.showInformationMessage(
+          'LC3: new join code for "' + c.id + '" is ' + j.code + ' (copied).');
+      } catch (e) { adminError(e); }
+    }),
+    vscode.commands.registerCommand('lc3.toggleSignup', async (item) => {
+      const c = (item && item.lc3) || {};
+      if (!c.id) return;
+      const open = !c.signup_open;
+      try {
+        await postJSON('/api/admin/classes/signup', { id: c.id, open });
+        adminTree.refresh();
+        vscode.window.showInformationMessage(open
+          ? 'LC3: "' + c.id + '" is accepting accounts with code ' + (c.code || '(none)') + '.'
+          : 'LC3: "' + c.id + '" is closed to new accounts.');
+      } catch (e) { adminError(e); }
+    }),
+
     vscode.commands.registerCommand('lc3.addStudent', async () => {
       try {
         const username = await vscode.window.showInputBox({ prompt: 'Student username' });
@@ -773,37 +822,6 @@ function registerAdmin(context) {
         if (cls === undefined) return;
         await postJSON('/api/admin/students', { username: username.trim(), password, class: cls });
         adminTree.refresh();
-      } catch (e) { adminError(e); }
-    }),
-    vscode.commands.registerCommand('lc3.addStudents', async () => {
-      try {
-        const cls = await pickClass('Class for the new students', true);
-        if (cls === undefined) return;
-        const how = await vscode.window.showQuickPick([
-          { label: 'Choose a CSV file', description: 'username,password per line', id: 'file' },
-          { label: 'Paste a CSV', description: 'for a handful of students', id: 'paste' },
-        ], { placeHolder: 'Add students from...' });
-        if (!how) return;
-        let csv;
-        if (how.id === 'file') {
-          const uris = await vscode.window.showOpenDialog({
-            canSelectMany: false, openLabel: 'Import',
-            filters: { 'CSV / text': ['csv', 'txt'] } });
-          if (!uris || !uris.length) return;
-          csv = new TextDecoder().decode(await vscode.workspace.fs.readFile(uris[0]));
-        } else {
-          csv = await vscode.window.showInputBox({
-            prompt: 'CSV rows, semicolon between students',
-            placeHolder: 'alice,pw1; bob,pw2; carol,pw3' });
-          if (!csv) return;
-          csv = csv.replace(/;/g, '\n');
-        }
-        const j = await postJSON('/api/admin/students/bulk', { class: cls, csv });
-        adminTree.refresh();
-        vscode.window.showInformationMessage(
-          'LC3: added ' + j.created.length + ' students' +
-          (j.skipped && j.skipped.length
-            ? (', skipped ' + j.skipped.length + ' (already exist or missing a password)') : '') + '.');
       } catch (e) { adminError(e); }
     }),
     vscode.commands.registerCommand('lc3.setStudentClass', async (item) => {

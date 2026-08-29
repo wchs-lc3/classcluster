@@ -458,6 +458,58 @@ try {
     }
   } catch (e) { bad('worker load/shell check failed: ' + e.message); }
 
+  // --- a student creates their own account with the class code ---
+  // Its own context, because this one starts signed out like a student's would.
+  try {
+    const code = await tpage.evaluate(async () => {
+      await fetch('/api/admin/classes/code', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'cp3' }) });
+      await fetch('/api/admin/classes/signup', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'cp3', open: true }) });
+      const r = await fetch('/api/admin/classes', { credentials: 'same-origin' });
+      const j = await r.json();
+      return (j.classes.find(c => c.id === 'cp3') || {}).code;
+    });
+    if (!code) throw new Error('the class was given no join code');
+    ok('the teacher can issue a join code and open sign-ups');
+
+    const sctx = await (browser.createBrowserContext
+      ? browser.createBrowserContext() : browser.createIncognitoBrowserContext());
+    const spage = await sctx.newPage();
+    await spage.goto(BASE + '/', { waitUntil: 'networkidle2' });
+    await spage.waitForSelector('#tosignup', { timeout: 20000 });
+    await spage.click('#tosignup');
+    await spage.waitForSelector('#sf', { timeout: 10000 });
+    ok('the login page offers Create an account');
+
+    // A wrong code must not get in, and must say so on the form.
+    await spage.type('#c', 'ZZZZ-ZZZZ');
+    await spage.type('#su', 'joiner' + Date.now().toString(36));
+    await spage.type('#sp', 'pw123456');
+    await spage.click('#sf button[type=submit]');
+    await new Promise(r => setTimeout(r, 2500));
+    const refused = await spage.evaluate(() => document.getElementById('se').textContent);
+    if (/not accepting/.test(refused)) ok('a wrong class code is refused on the form');
+    else bad('wrong code was not refused: ' + refused);
+
+    // The real code, typed the way a student would read it off a board.
+    await spage.evaluate(() => { document.getElementById('c').value = ''; });
+    await spage.click('#c');
+    await spage.type('#c', code.toLowerCase().replace('-', ''));
+    await spage.click('#sf button[type=submit]');
+    await spage.waitForSelector('.monaco-workbench', { timeout: 90000 });
+    ok('the class code creates the account and signs the student straight in');
+    await new Promise(r => setTimeout(r, 8000));
+    const seen = await spage.evaluate(() => document.body.innerText);
+    if (/hello-py/.test(seen)) ok('the new account already has its class assignment');
+    else bad('the new account has no assignment in the explorer');
+    await sctx.close();
+  } catch (e) { bad('sign-up with a class code failed: ' + e.message); }
+
 } catch (e) {
   bad('unexpected: ' + e.message);
 } finally {

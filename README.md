@@ -26,11 +26,18 @@ assignments from the Class Management view; sample assignment zips are in
 
 Each class has one language. A student belongs to one class and loads only that
 language's runtime: Pyodide in the browser for Python, a real JVM in the cluster
-for Java. A student sees only
-their class's assignments. The teacher creates classes, adds students (one at a time or in bulk from a
-`username,password` CSV), and uploads assignments from the Class Management view
-inside the editor (an entry in the activity bar, teacher accounts only). One
-assignment can be published to several classes of the same language at once.
+for Java. A student sees only their class's assignments. The teacher creates classes and uploads assignments
+from the Class Management view inside the editor (an entry in the activity bar,
+teacher accounts only). One assignment can be published to several classes of
+the same language at once.
+
+Students make their own accounts. Each class has a join code; the teacher opens
+sign-ups, reads the code out, and the class creates accounts from the login page
+and lands straight in the editor with that class's work already in their files.
+There is no roster to prepare and no list of passwords to hand round. Sign-ups
+are closed until the teacher opens them, and closing them again afterwards is
+the usual habit. A code that gets out is replaced from the same view, which
+retires the old one immediately.
 
 ## Capabilities
 
@@ -52,6 +59,10 @@ assignment can be published to several classes of the same language at once.
   correct. Grading runs in a bwrap + systemd sandbox (no network, no filesystem
   beyond its job directory, memory and process caps, a hard timeout); the test
   source is deleted before student code runs, so it cannot read the answers.
+- Joining a class: a code per class, sign-ups opened and closed by the teacher,
+  and accounts students create themselves. A wrong code is refused without
+  saying whether it was the code or a closed class that was wrong, and an
+  address that keeps guessing stops being answered.
 - Teacher grading portal: the grade is the teacher's, not the tests'. From the
   Class Management view the teacher recalls an assignment (snapshots every
   student's code), reads it read-only, and records a score and comment. Publish
@@ -107,6 +118,9 @@ knows. Leave it unset if you do not want it.
   the test source blocks reading it from disk, but a very advanced student could
   still introspect in-memory objects; closing that fully needs out-of-process
   grading, which this does not do.
+- Sign-ups are open to anyone who can reach the login page and has the code.
+  On a classroom LAN that is the point; the teacher decides when the door is
+  open. Close sign-ups once the class is in.
 - The worker shell is a plain root shell, not a restricted one, and it is not
   sandboxed; a shell that could not see the service logs would not answer the
   question it was opened to answer. It is off unless you configure a token.

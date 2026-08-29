@@ -157,6 +157,14 @@ func collectFiles(dir string, maxPer, maxTotal int64) map[string]string {
 
 // ---------- auth ----------
 
+func setSession(w http.ResponseWriter, username string) {
+	token := store.NewSession(username)
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: token, Path: "/", MaxAge: int(sessionTTL.Seconds()),
+		HttpOnly: true, SameSite: http.SameSiteLaxMode,
+	})
+}
+
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct{ Username, Password string }
 	if err := readBody(r, &body); err != nil {
@@ -169,11 +177,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "bad username or password")
 		return
 	}
-	token := store.NewSession(u.Username)
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: token, Path: "/", MaxAge: int(sessionTTL.Seconds()),
-		HttpOnly: true, SameSite: http.SameSiteLaxMode,
-	})
+	setSession(w, u.Username)
 	writeJSON(w, 200, map[string]any{"ok": true, "username": u.Username, "role": u.Role})
 }
 
@@ -807,72 +811,6 @@ func handleAdminAddStudent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-// handleAdminBulkStudents creates many students from a CSV the teacher pastes
-// or uploads: one "username,password" per line (a header line naming those two
-// columns is allowed). Existing usernames are skipped, never overwritten.
-func handleAdminBulkStudents(w http.ResponseWriter, r *http.Request) {
-	if requireTeacher(w, r) == nil {
-		return
-	}
-	var body struct {
-		Class string `json:"class"`
-		CSV   string `json:"csv"`
-	}
-	if err := readBody(r, &body); err != nil {
-		fail(w, 400, "bad json")
-		return
-	}
-	if body.Class != "" && store.ClassLang(body.Class) == "" {
-		fail(w, 400, "unknown class")
-		return
-	}
-
-	type row struct{ user, pass string }
-	var rows []row
-	for _, line := range strings.Split(body.CSV, "\n") {
-		line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, ",", 2)
-		user := strings.TrimSpace(parts[0])
-		pass := ""
-		if len(parts) == 2 {
-			pass = strings.TrimSpace(parts[1])
-		}
-		// tolerate a header line
-		if strings.EqualFold(user, "username") && strings.EqualFold(pass, "password") {
-			continue
-		}
-		rows = append(rows, row{user, pass})
-	}
-	if len(rows) == 0 {
-		fail(w, 400, "no rows in the CSV")
-		return
-	}
-	if len(rows) > 500 {
-		fail(w, 400, "too many at once (max 500)")
-		return
-	}
-
-	created := []string{}
-	skipped := []string{}
-	for _, rw := range rows {
-		if !validID(rw.user) || rw.pass == "" {
-			skipped = append(skipped, rw.user)
-			continue
-		}
-		if store.GetUser(rw.user) != nil {
-			skipped = append(skipped, rw.user)
-			continue
-		}
-		store.PutUser(rw.user, rw.pass, "student", body.Class)
-		_ = os.MkdirAll(filepath.Join(studentsDir(), rw.user), 0o755)
-		created = append(created, rw.user)
-	}
-	writeJSON(w, 200, map[string]any{"created": created, "skipped": skipped})
-}
-
 func handleAdminSetPassword(w http.ResponseWriter, r *http.Request) {
 	if requireTeacher(w, r) == nil {
 		return
@@ -981,8 +919,9 @@ func handleAdminAddClass(w http.ResponseWriter, r *http.Request) {
 	if body.Name == "" {
 		body.Name = body.ID
 	}
-	store.PutClass(&Class{ID: body.ID, Name: body.Name, Lang: body.Lang})
-	writeJSON(w, 200, map[string]any{"ok": true})
+	code := joinCode()
+	store.PutClass(&Class{ID: body.ID, Name: body.Name, Lang: body.Lang, Code: code})
+	writeJSON(w, 200, map[string]any{"ok": true, "code": code})
 }
 
 func handleAdminDelClass(w http.ResponseWriter, r *http.Request) {
@@ -1815,6 +1754,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/login", handleLogin)
+	mux.HandleFunc("POST /api/signup", handleSignup)
 	mux.HandleFunc("POST /api/logout", handleLogout)
 	mux.HandleFunc("GET /api/me", handleMe)
 	mux.HandleFunc("GET /api/fs/stat", handleFsStat)
@@ -1841,10 +1781,12 @@ func main() {
 	mux.HandleFunc("POST /api/admin/students/setclass", handleAdminSetClass)
 	mux.HandleFunc("POST /api/admin/students/setpassword", handleAdminSetPassword)
 	mux.HandleFunc("POST /api/account/password", handleAccountPassword)
-	mux.HandleFunc("POST /api/admin/students/bulk", handleAdminBulkStudents)
 	mux.HandleFunc("GET /api/admin/classes", handleAdminClasses)
 	mux.HandleFunc("POST /api/admin/classes", handleAdminAddClass)
 	mux.HandleFunc("POST /api/admin/classes/delete", handleAdminDelClass)
+	mux.HandleFunc("POST /api/admin/classes/code", handleAdminClassCode)
+	mux.HandleFunc("POST /api/admin/classes/signup", handleAdminClassSignup)
+	mux.HandleFunc("POST /api/admin/signup/unlock", handleAdminSignupUnlock)
 	mux.HandleFunc("POST /api/admin/assignments/upload", handleAdminUploadAssignment)
 	mux.HandleFunc("POST /api/admin/assignments/from-folder", handleAdminAssignmentFromFolder)
 	mux.HandleFunc("POST /api/admin/assignments/template", handleAdminAssignmentTemplate)

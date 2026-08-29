@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"golang.org/x/crypto/scrypt"
+	_ "modernc.org/sqlite"
 )
 
 type User struct {
@@ -34,6 +34,10 @@ type Class struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	Lang string `json:"lang"` // python | java
+	// Students join by typing this code, but only while the teacher has
+	// signup open. Teachers see it; nobody else is served it.
+	Code       string `json:"code"`
+	SignupOpen bool   `json:"signup_open"`
 }
 
 type Worker struct {
@@ -85,7 +89,8 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY, pwhash TEXT NOT NULL,
     role TEXT NOT NULL, class TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS classes (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, lang TEXT NOT NULL);
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, lang TEXT NOT NULL,
+    code TEXT NOT NULL DEFAULT '', signup_open INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY, username TEXT NOT NULL, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS workers (
@@ -101,6 +106,15 @@ CREATE TABLE IF NOT EXISTS grades (
 `
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
+	}
+	// Classes predating self-signup have neither column. Adding one that is
+	// already there is an error, and the only error worth reporting, so both
+	// are ignored: a fresh database gets them from the schema above.
+	for _, alter := range []string{
+		"ALTER TABLE classes ADD COLUMN code TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE classes ADD COLUMN signup_open INTEGER NOT NULL DEFAULT 0",
+	} {
+		_, _ = db.Exec(alter)
 	}
 	return &Store{db: db}, nil
 }
@@ -224,10 +238,48 @@ func (s *Store) DeleteStudent(username string) {
 // ---- classes ----
 
 func (s *Store) PutClass(c *Class) {
+	// The code and the signup switch are managed on their own, so renaming a
+	// class does not quietly hand out a new code or reopen signup.
 	_, _ = s.db.Exec(
-		"INSERT INTO classes(id, name, lang) VALUES(?,?,?) "+
+		"INSERT INTO classes(id, name, lang, code, signup_open) VALUES(?,?,?,?,?) "+
 			"ON CONFLICT(id) DO UPDATE SET name=excluded.name, lang=excluded.lang",
-		c.ID, c.Name, c.Lang)
+		c.ID, c.Name, c.Lang, c.Code, boolInt(c.SignupOpen))
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// SetClassCode replaces a class's join code. The old one stops working, which
+// is the point: it is how a teacher reacts to a code that got out.
+func (s *Store) SetClassCode(id, code string) {
+	_, _ = s.db.Exec("UPDATE classes SET code=? WHERE id=?", code, id)
+}
+
+func (s *Store) SetClassSignup(id string, open bool) {
+	_, _ = s.db.Exec("UPDATE classes SET signup_open=? WHERE id=?", boolInt(open), id)
+}
+
+// ClassByCode finds the class a join code belongs to, and only while that class
+// is accepting signups. A code for a closed class matches nothing.
+func (s *Store) ClassByCode(code string) *Class {
+	if code == "" {
+		return nil
+	}
+	c := &Class{}
+	var open int
+	err := s.db.QueryRow(
+		"SELECT id, name, lang, code, signup_open FROM classes "+
+			"WHERE code=? AND signup_open=1", code).
+		Scan(&c.ID, &c.Name, &c.Lang, &c.Code, &open)
+	if err != nil {
+		return nil
+	}
+	c.SignupOpen = open != 0
+	return c
 }
 
 func (s *Store) DeleteClass(id string) {
@@ -244,7 +296,8 @@ func (s *Store) ClassLang(id string) string {
 }
 
 func (s *Store) AllClasses() []Class {
-	rows, err := s.db.Query("SELECT id, name, lang FROM classes ORDER BY id")
+	rows, err := s.db.Query(
+		"SELECT id, name, lang, code, signup_open FROM classes ORDER BY id")
 	if err != nil {
 		return nil
 	}
@@ -252,7 +305,9 @@ func (s *Store) AllClasses() []Class {
 	out := []Class{}
 	for rows.Next() {
 		var c Class
-		if rows.Scan(&c.ID, &c.Name, &c.Lang) == nil {
+		var open int
+		if rows.Scan(&c.ID, &c.Name, &c.Lang, &c.Code, &open) == nil {
+			c.SignupOpen = open != 0
 			out = append(out, c)
 		}
 	}

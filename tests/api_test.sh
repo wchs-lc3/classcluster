@@ -183,12 +183,51 @@ tpost /api/admin/students/setclass '{"username":"demo","class":"cp3"}' >/dev/nul
 has "$(curl -s -b $JT $BASE/api/admin/workers)" '"local":true' "gateway registered as a local worker"
 chk "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d '{"id":"x","token":"WRONG"}' $BASE/api/worker/heartbeat)" "403" "worker heartbeat rejects a bad token"
 
-echo "== teacher: bulk students from CSV =="
-bulk=$(tpost /api/admin/students/bulk '{"class":"cp3","csv":"username,password\nbulk1,bp1\nbulk2,bp2\n"}')
-{ echo "$bulk" | grep -q '"bulk1"' && echo "$bulk" | grep -q '"bulk2"'; } && ok "bulk CSV creates two students" || bad "bulk: $bulk"
-login /tmp/lc3-jb bulk1 bp1
-has "$(curl -s -b /tmp/lc3-jb $BASE/api/me)" '"username":"bulk1"' "bulk-created student can log in"
-has "$(tpost /api/admin/students/bulk '{"class":"cp3","csv":"bulk1,other\n"}')" '"skipped":\["bulk1"\]' "bulk skips an existing username"
+echo "== students create their own accounts with a class code =="
+signup() { # code user pass -> body, into the jar named first
+    curl -s -c "$1" -X POST -H 'Content-Type: application/json' \
+        -d "{\"code\":\"$2\",\"username\":\"$3\",\"password\":\"$4\"}" $BASE/api/signup
+}
+tpost /api/admin/classes '{"id":"joincls","name":"Join","lang":"python"}' >/dev/null
+code=$(curl -s -b $JT $BASE/api/admin/classes |
+    python3 -c 'import sys,json;print([c["code"] for c in json.load(sys.stdin)["classes"] if c["id"]=="joincls"][0])')
+[ -n "$code" ] && ok "a new class is given a join code" || bad "no join code on a new class"
+# Closed by default: a code alone is not enough.
+has "$(signup /tmp/lc3-js1 "$code" joinkid pw123456)" 'not accepting' "sign-ups are closed until the teacher opens them"
+tpost /api/admin/classes/signup '{"id":"joincls","open":true}' >/dev/null
+has "$(signup /tmp/lc3-js1 ZZZZ-ZZZZ joinkid pw123456)" 'not accepting' "a wrong code is refused"
+has "$(signup /tmp/lc3-js1 "$code" joinkid short)" 'at least 6' "a too-short password is refused"
+# The dash and the case are cosmetic, so a student who drops them still gets in.
+loose=$(echo "$code" | tr 'A-Z' 'a-z' | tr -d '-')
+has "$(signup /tmp/lc3-js1 "$loose" joinkid pw123456)" '"class":"joincls"' "the right code creates the account"
+has "$(curl -s -b /tmp/lc3-js1 $BASE/api/me)" '"username":"joinkid"' "signing up signs the student in"
+has "$(signup /tmp/lc3-js2 "$code" joinkid pw123456)" 'taken' "a taken username is refused"
+# A new code retires the old one, which is how a leaked code is dealt with.
+newcode=$(tpost /api/admin/classes/code '{"id":"joincls"}' |
+    python3 -c 'import sys,json;print(json.load(sys.stdin)["code"])')
+has "$(signup /tmp/lc3-js2 "$code" joinkid2 pw123456)" 'not accepting' "the old code stops working"
+has "$(signup /tmp/lc3-js2 "$newcode" joinkid2 pw123456)" '"class":"joincls"' "the new code works"
+tpost /api/admin/classes/signup '{"id":"joincls","open":false}' >/dev/null
+has "$(signup /tmp/lc3-js3 "$newcode" joinkid3 pw123456)" 'not accepting' "closing sign-ups shuts the door again"
+chk "$(curl -s -o /dev/null -w '%{http_code}' -b $J -X POST -H 'Content-Type: application/json' \
+    -d '{"id":"joincls"}' $BASE/api/admin/classes/code)" "403" "a student cannot reroll a class code"
+# Guessing at codes is what the limiter is for: a run of wrong ones stops
+# being answered long before it could work through the code space.
+tpost /api/admin/classes/signup '{"id":"joincls","open":true}' >/dev/null
+limited=no
+for i in $(seq 1 25); do
+    st=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+        -d '{"code":"ZZZZ-ZZZZ","username":"guess'"$i"'","password":"pw123456"}' $BASE/api/signup)
+    [ "$st" = "429" ] && { limited=yes; break; }
+done
+[ "$limited" = yes ] && ok "a run of wrong codes gets rate limited" || bad "wrong codes were never rate limited"
+# The teacher can lift a lockout, so a student who fumbled the code is not
+# stuck for the rest of the window (and this suite can run twice in a row).
+tpost /api/admin/signup/unlock '{}' >/dev/null
+tpost /api/admin/classes/signup '{"id":"joincls","open":true}' >/dev/null
+has "$(signup /tmp/lc3-js4 "$newcode" joinkid4 pw123456)" '"class":"joincls"' "clearing the lockout lets sign-ups through again"
+for u in joinkid joinkid2 joinkid4; do tpost /api/admin/students/delete "{\"username\":\"$u\"}" >/dev/null; done
+tpost /api/admin/classes/delete '{"id":"joincls"}' >/dev/null
 
 echo "== teacher: one assignment across multiple classes =="
 tpost /api/admin/classes '{"id":"secb","name":"Sec B","lang":"python"}' >/dev/null

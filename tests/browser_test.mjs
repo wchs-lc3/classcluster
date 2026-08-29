@@ -3,18 +3,59 @@
 // student's files load, drives the hidden runtime over the same BroadcastChannel
 // the extension uses (so real Pyodide output is exercised), and checks that the
 // LC3 extension activated. Uses system Chrome via puppeteer-core.
-import puppeteer from '/Storage/claude-tmp/claude-1000/-home-artur-classcluster/82aa4bb4-637e-415e-9e26-3c8b604b7896/scratchpad/node_modules/puppeteer-core/lib/puppeteer/puppeteer-core.js';
+//
+//   npm i puppeteer-core          # anywhere node will resolve it from
+//   node tests/browser_test.mjs http://<gateway>
+//
+// PUPPETEER_CORE overrides where puppeteer-core is loaded from, and CHROME
+// which browser binary it drives.
+import { readFileSync, existsSync } from 'node:fs';
 
-import { readFileSync } from 'node:fs';
+const puppeteer = await (async () => {
+  const tried = [];
+  for (const spec of [process.env.PUPPETEER_CORE, 'puppeteer-core', 'puppeteer']) {
+    if (!spec) continue;
+    try { return (await import(spec)).default; } catch (e) { tried.push(spec); }
+  }
+  console.error('could not load puppeteer-core (tried: ' + tried.join(', ') + ').\n' +
+    'Install it with "npm i puppeteer-core", or point PUPPETEER_CORE at a copy.');
+  process.exit(2);
+})();
 
-const BASE = process.argv[2] || 'http://192.168.1.146';
+// System Chrome, wherever this machine keeps it.
+function findChrome() {
+  const candidates = [process.env.CHROME,
+    '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/opt/google/chrome/chrome',
+    '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'];
+  for (const p of candidates) if (p && existsSync(p)) return p;
+  console.error('no Chrome found. Install one, or point CHROME at the binary.');
+  process.exit(2);
+}
+
+const BASE = process.argv[2] || process.env.LC3_BASE;
+if (!BASE) {
+  console.error('usage: node tests/browser_test.mjs <gateway-url>   (or set LC3_BASE)');
+  process.exit(2);
+}
 let pass = 0, fail = 0;
 const ok = (m) => { console.log('  ok   - ' + m); pass++; };
 const bad = (m) => { console.log('  FAIL - ' + m); fail++; };
 
 // Opening the command palette headlessly is occasionally missed; retry it.
+// The shortcut goes to whatever holds focus, and after a terminal or an editor
+// has taken it the workbench sometimes does not see the chord at all, so click
+// the workbench first and give a loaded machine enough attempts to get there.
 async function paletteRun(pg, cmd) {
-  for (let a = 0; a < 5; a++) {
+  for (let a = 0; a < 10; a++) {
+    if (a > 0) {
+      await pg.evaluate(() => {
+        const wb = document.querySelector('.monaco-workbench');
+        if (wb) wb.focus();
+      });
+      await pg.keyboard.press('Escape');
+      await new Promise(r => setTimeout(r, 300));
+    }
     await pg.keyboard.down('Control'); await pg.keyboard.down('Shift');
     await pg.keyboard.press('KeyP');
     await pg.keyboard.up('Shift'); await pg.keyboard.up('Control');
@@ -54,7 +95,7 @@ async function bootstrap() {
 await bootstrap();
 
 const browser = await puppeteer.launch({
-  executablePath: '/usr/bin/google-chrome-stable',
+  executablePath: findChrome(),
   headless: 'new',
   acceptInsecureCerts: true,
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
@@ -362,6 +403,112 @@ try {
   const teacherHasPy = tpage.frames().some(f => f.url().includes('/runtime/') && f.url().includes('lang=python'));
   if (teacherHasPy) ok('teacher gets the Python runtime (Java via cluster)');
   else bad('teacher missing the Python runtime');
+
+  // --- worker load, and the shell if this deployment has one configured ---
+  try {
+    const workers = await tpage.evaluate(async () => {
+      const r = await fetch('/api/admin/workers', { credentials: 'same-origin' });
+      return r.json();
+    });
+    const load = (workers.workers[0] || {}).load || {};
+    if (load.reachable && typeof load.max_runs === 'number') ok('workers report their load to the admin view');
+    else bad('no load report from the first worker');
+
+    if (!workers.shell) {
+      console.log('  skip - worker shell (LC3_SHELL_TOKEN is not set on this deployment)');
+    } else {
+      const host = workers.workers[0].host;
+      const started = await tpage.evaluate(async (h) => {
+        const r = await fetch('/api/admin/shell/start', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ host: h, rows: 24, cols: 80 }),
+        });
+        return r.json();
+      }, host);
+      if (started.status !== 'running') throw new Error('shell did not start: ' + JSON.stringify(started));
+      // Typed characters must reach the pty in the order they were typed, so
+      // the relay has to send them one request at a time.
+      const typed = 'echo LC3-ORDER-abcdefghijklmnopqrstuvwxyz\n';
+      const saw = await tpage.evaluate(async (run, text) => {
+        const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+        for (const ch of text) {
+          await fetch('/api/admin/shell/input?run=' + run, {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: b64(ch) }),
+          });
+        }
+        let since = 0, all = '';
+        for (let i = 0; i < 20; i++) {
+          const r = await fetch('/api/admin/shell/output?run=' + run + '&since=' + since,
+            { credentials: 'same-origin' });
+          const j = await r.json();
+          all += atob(j.data || '');
+          since = j.next;
+          if (/LC3-ORDER-abcdefghijklmnopqrstuvwxyz/.test(all)) return true;
+          if (j.done) break;
+        }
+        return all;
+      }, started.run, typed);
+      if (saw === true) ok('the worker shell runs what was typed, in order');
+      else bad('the worker shell scrambled or dropped input: ' + String(saw).slice(-160));
+      await tpage.evaluate((run) => fetch('/api/admin/shell/kill?run=' + run,
+        { method: 'POST', credentials: 'same-origin' }), started.run);
+    }
+  } catch (e) { bad('worker load/shell check failed: ' + e.message); }
+
+  // --- a student creates their own account with the class code ---
+  // Its own context, because this one starts signed out like a student's would.
+  try {
+    const code = await tpage.evaluate(async () => {
+      await fetch('/api/admin/classes/code', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'cp3' }) });
+      await fetch('/api/admin/classes/signup', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'cp3', open: true }) });
+      const r = await fetch('/api/admin/classes', { credentials: 'same-origin' });
+      const j = await r.json();
+      return (j.classes.find(c => c.id === 'cp3') || {}).code;
+    });
+    if (!code) throw new Error('the class was given no join code');
+    ok('the teacher can issue a join code and open sign-ups');
+
+    const sctx = await (browser.createBrowserContext
+      ? browser.createBrowserContext() : browser.createIncognitoBrowserContext());
+    const spage = await sctx.newPage();
+    await spage.goto(BASE + '/', { waitUntil: 'networkidle2' });
+    await spage.waitForSelector('#tosignup', { timeout: 20000 });
+    await spage.click('#tosignup');
+    await spage.waitForSelector('#sf', { timeout: 10000 });
+    ok('the login page offers Create an account');
+
+    // A wrong code must not get in, and must say so on the form.
+    await spage.type('#c', 'ZZZZ-ZZZZ');
+    await spage.type('#su', 'joiner' + Date.now().toString(36));
+    await spage.type('#sp', 'pw123456');
+    await spage.click('#sf button[type=submit]');
+    await new Promise(r => setTimeout(r, 2500));
+    const refused = await spage.evaluate(() => document.getElementById('se').textContent);
+    if (/not accepting/.test(refused)) ok('a wrong class code is refused on the form');
+    else bad('wrong code was not refused: ' + refused);
+
+    // The real code, typed the way a student would read it off a board.
+    await spage.evaluate(() => { document.getElementById('c').value = ''; });
+    await spage.click('#c');
+    await spage.type('#c', code.toLowerCase().replace('-', ''));
+    await spage.click('#sf button[type=submit]');
+    await spage.waitForSelector('.monaco-workbench', { timeout: 90000 });
+    ok('the class code creates the account and signs the student straight in');
+    await new Promise(r => setTimeout(r, 8000));
+    const seen = await spage.evaluate(() => document.body.innerText);
+    if (/hello-py/.test(seen)) ok('the new account already has its class assignment');
+    else bad('the new account has no assignment in the explorer');
+    await sctx.close();
+  } catch (e) { bad('sign-up with a class code failed: ' + e.message); }
 
 } catch (e) {
   bad('unexpected: ' + e.message);

@@ -107,7 +107,11 @@ _grade_lock = threading.Semaphore(GRADE_MAX)
 SHELL_TOKEN = env_str("LC3_SHELL_TOKEN", "")
 SHELL_CMD = env_str("LC3_SHELL", "/bin/bash")
 SHELL_MAX = max(1, env_int("LC3_MAX_SHELLS", 2))
-SHELL_IDLE_SEC = max(60, env_int("LC3_SHELL_IDLE_SEC", 1800))
+# A live terminal long-polls for output at least every 25 seconds, so anything
+# quiet for minutes is a browser tab that went away without closing its shell.
+# Closing the tab is the normal way out, and a slot held by a shell nobody is
+# reading is a slot the next teacher cannot have.
+SHELL_IDLE_SEC = max(60, env_int("LC3_SHELL_IDLE_SEC", 300))
 
 
 def have_systemd_run():

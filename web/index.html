@@ -16,7 +16,13 @@
       font-family: -apple-system, Segoe UI, Ubuntu, Roboto, sans-serif;
     }
     #lc3-gate .card { width: 300px; }
-    #lc3-gate h1 { font-size: 20px; font-weight: 600; margin: 0 0 24px; text-align: center; }
+    #lc3-gate h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; text-align: center; }
+    /* Sits under the title, nudged right of centre rather than squarely
+       beneath it, so it reads as a signature and not a subtitle. */
+    #lc3-gate .by {
+      font-size: 12px; color: #8a8a8a; text-align: center;
+      margin: 0 0 24px; padding-left: 72px;
+    }
     #lc3-gate label { display: block; font-size: 12px; color: #9a9a9a; margin: 14px 0 5px; }
     #lc3-gate input {
       width: 100%; box-sizing: border-box; font-size: 14px; padding: 8px 10px;
@@ -28,6 +34,18 @@
       color: #ffffff; background: #0e639c; border: 0; border-radius: 4px; cursor: pointer;
     }
     #lc3-gate button:hover { background: #1177bb; }
+    /* The way to the other form: present, but not competing with Sign in. */
+    #lc3-gate button.alt {
+      margin-top: 10px; background: none; color: #7fb6e0;
+      font-size: 12px; padding: 4px;
+    }
+    #lc3-gate button.alt:hover { background: none; text-decoration: underline; }
+    /* A code is read off a board and typed in, so make it hard to mistype and
+       obvious when it is right. */
+    #lc3-gate input.code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 2px; text-transform: uppercase;
+    }
     #lc3-gate .err { color: #f14c4c; font-size: 12px; min-height: 16px; margin-top: 12px; text-align: center; }
     #lc3-gate .loading { color: #9a9a9a; font-size: 14px; }
 
@@ -54,7 +72,7 @@
 </head>
 <body aria-label="">
   <div id="lc3-gate"><div class="loading">Loading LC3...</div></div>
-  <div id="lc3-credit">By MrFizz and JL681<span class="ver">v135.2537.5328-b2026.08.28-sha384DUauvevwvyuvNDXIEwbcbeyuwve</span></div>
+  <div id="lc3-credit"><span class="ver">v135.2537.5328-b2026.08.28-sha384DUauvevwvyuvNDXIEwbcbeyuwve</span></div>
 
 <script>
 (function () {
@@ -62,15 +80,37 @@
   const gate = document.getElementById('lc3-gate');
   const credit = document.getElementById('lc3-credit');
 
+  const heading =
+    '<h1>LC3 Classroom</h1>' +
+    '<div class="by">By MrFizz and JL681</div>';
+
+  // The card shows the identity as its own <div>, so the reply from either
+  // form can be handed to start() the same way.
+  async function enter(reply) {
+    const meResp = await fetch('/api/me', { credentials: 'same-origin' });
+    start(meResp.ok ? await meResp.json() : reply);
+  }
+
+  // Whatever the server said went wrong, or a fallback when it said nothing.
+  async function detail(resp, fallback) {
+    try {
+      const j = await resp.json();
+      if (j && j.detail) return j.detail;
+    } catch (x) { /* not json */ }
+    return fallback;
+  }
+
   function showLogin(message) {
     gate.innerHTML =
       '<form class="card" id="lf">' +
-      '<h1>LC3 Classroom</h1>' +
+      heading +
       '<label>Username</label><input id="u" autocomplete="username" autofocus>' +
       '<label>Password</label><input id="p" type="password" autocomplete="current-password">' +
       '<button type="submit">Sign in</button>' +
       '<div class="err" id="e">' + (message || '') + '</div>' +
+      '<button type="button" class="alt" id="tosignup">Create an account</button>' +
       '</form>';
+    document.getElementById('tosignup').addEventListener('click', () => showSignup(''));
     document.getElementById('lf').addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const e = document.getElementById('e'); e.textContent = '';
@@ -86,8 +126,49 @@
         if (!r.ok) { e.textContent = 'Wrong username or password.'; return; }
         // The login reply is minimal; fetch the full identity (with the class
         // language) so the right runtime is mounted.
-        const meResp = await fetch('/api/me', { credentials: 'same-origin' });
-        start(meResp.ok ? await meResp.json() : await r.json());
+        await enter(await r.json());
+      } catch (x) { e.textContent = 'Server unreachable.'; }
+    });
+  }
+
+  // Students make their own accounts with the code their teacher reads out.
+  // Signing up puts them in that class and signs them in, so a first lesson is
+  // one form and nothing to hand round on paper.
+  function showSignup(message) {
+    gate.innerHTML =
+      '<form class="card" id="sf">' +
+      heading +
+      '<label>Class code</label>' +
+      '<input id="c" class="code" placeholder="XXXX-XXXX" autocapitalize="characters" ' +
+      'autocomplete="off" spellcheck="false" autofocus>' +
+      '<label>Pick a username</label><input id="su" autocomplete="username">' +
+      '<label>Pick a password</label>' +
+      '<input id="sp" type="password" autocomplete="new-password">' +
+      '<button type="submit">Create account</button>' +
+      '<div class="err" id="se">' + (message || '') + '</div>' +
+      '<button type="button" class="alt" id="tologin">I already have an account</button>' +
+      '</form>';
+    document.getElementById('tologin').addEventListener('click', () => showLogin(''));
+    document.getElementById('sf').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const e = document.getElementById('se'); e.textContent = '';
+      const pw = document.getElementById('sp').value;
+      if (pw.length < 6) { e.textContent = 'Use a password of at least 6 characters.'; return; }
+      try {
+        const r = await fetch('/api/signup', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code: document.getElementById('c').value,
+            username: document.getElementById('su').value.trim(),
+            password: pw
+          })
+        });
+        if (!r.ok) {
+          e.textContent = await detail(r, 'Could not create the account.');
+          return;
+        }
+        await enter(await r.json());
       } catch (x) { e.textContent = 'Server unreachable.'; }
     });
   }

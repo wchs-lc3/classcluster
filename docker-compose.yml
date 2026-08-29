@@ -11,7 +11,7 @@
 # Every LC3_* setting is an image default (see balena/*/Dockerfile) so a fleet,
 # device, or service variable in the balenaCloud dashboard overrides it with no
 # rebuild. Only two must be set before a device is useful:
-#   LC3_GATEWAY       the gateway's IP or hostname, e.g. 192.168.1.146
+#   LC3_GATEWAY       the gateway's IP or hostname, e.g. 10.0.0.5
 #   LC3_WORKER_TOKEN  contents of /srv/lc3/state/worker_token on the gateway
 version: '2.4'
 

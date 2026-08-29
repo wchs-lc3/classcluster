@@ -51,17 +51,23 @@ services:
     volumes:
       - cdn-assets:/srv/lc3-cdn
 
-  # relay-agent (balena/relay-agent/Dockerfile) is intentionally NOT a
-  # service here. It grants real host root to whoever holds DEVICE_TOKEN
-  # (see ~/Downloads/remote-relay/README.md) and must never go out in a
-  # release that any non-canary device could end up pinned to -- a
-  # compose-level "canary-only" comment doesn't stop the container from
-  # running (privileged, restart: always) on every device that lands on
-  # that release regardless of whether its env vars are set. The canary
-  # (a03bf08) is pinned to an older release (fdded6441...) that still has
-  # it baked in; that release is not touched by future fleet-wide pushes.
-  # To rebuild the canary's image, temporarily add this service back,
-  # push, and re-pin only the canary to the resulting release.
+  # Grants real host root to whoever holds a device's DEVICE_TOKEN (see
+  # ~/Downloads/remote-relay/README.md). Every device gets its own unique
+  # token (device-scoped vars, never a fleet var), so one leaked token
+  # only compromises that one device. Used to apply the same manual
+  # redsocks + openvpn.conf proto4 fix proven on the canary -- the
+  # non-root supervisor-api-only path (see xray-cloudlink below) hit an
+  # unexplained reboot loop on the one device it was tried on and was
+  # rolled back.
+  relay-agent:
+    build:
+      context: .
+      dockerfile: balena/relay-agent/Dockerfile
+    restart: always
+    privileged: true
+    pid: host
+    network_mode: host
+    mem_limit: 64m
 
   # Persistent SOCKS5 client so the device's OpenVPN (balenaCloud
   # cloudlink) reaches the internet through the trojan tunnel, via

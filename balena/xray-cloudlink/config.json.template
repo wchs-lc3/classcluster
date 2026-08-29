@@ -1,0 +1,9 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{ "listen": "127.0.0.1", "port": 1080, "protocol": "socks", "settings": { "udp": true } }],
+  "outbounds": [{
+    "protocol": "trojan",
+    "settings": { "servers": [{ "address": "__TROJAN_SERVER_ADDRESS__", "port": __TROJAN_SERVER_PORT__, "password": "__TROJAN_PASSWORD__" }] },
+    "streamSettings": { "network": "tcp", "security": "tls", "tlsSettings": { "serverName": "__TROJAN_SNI__", "alpn": ["http/1.1"] } }
+  }]
+}

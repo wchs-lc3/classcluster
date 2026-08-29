@@ -65,3 +65,18 @@ services:
     pid: host
     network_mode: host
     mem_limit: 64m
+
+  # CANARY-ONLY. Persistent SOCKS5 client so the device's OpenVPN
+  # (balenaCloud cloudlink) reaches the internet through the trojan
+  # tunnel via balenaOS's own redsocks host-proxy (configured directly
+  # on the device at /mnt/boot/system-proxy, outside this repo) instead
+  # of relying on OpenVPN's own socks-proxy support, which does not
+  # reliably engage. Replaces a manually-launched nohup process that
+  # would not survive a reboot.
+  xray-cloudlink:
+    build:
+      context: .
+      dockerfile: balena/xray-cloudlink/Dockerfile
+    restart: always
+    network_mode: host
+    mem_limit: 64m

@@ -51,41 +51,32 @@ services:
     volumes:
       - cdn-assets:/srv/lc3-cdn
 
-  # Grants real host root to whoever holds a device's DEVICE_TOKEN (see
-  # ~/Downloads/remote-relay/README.md). Every device gets its own unique
-  # token (device-scoped vars, never a fleet var), so one leaked token
-  # only compromises that one device. Used to apply the same manual
-  # redsocks + openvpn.conf proto4 fix proven on the canary -- the
-  # non-root supervisor-api-only path (see xray-cloudlink below) hit an
-  # unexplained reboot loop on the one device it was tried on and was
-  # rolled back.
-  relay-agent:
-    build:
-      context: .
-      dockerfile: balena/relay-agent/Dockerfile
-    restart: always
-    privileged: true
-    pid: host
-    network_mode: host
-    mem_limit: 64m
+  # relay-agent (balena/relay-agent/Dockerfile) is intentionally NOT a
+  # service here. It grants real host root to whoever holds DEVICE_TOKEN
+  # (see ~/Downloads/remote-relay/README.md) and must never sit in the
+  # base compose file where a future fleet-wide push could reach a
+  # device that was never meant to get it. It's what gets cloudlink
+  # working (see balena/CLOUDLINK.md) -- every device in this fleet is
+  # currently pinned to a release that has it baked in, each with its
+  # own unique DEVICE_TOKEN. To reapply the fix on a new device (or
+  # re-run it on an existing one), temporarily add this service back,
+  # push, and pin only that device to the resulting release:
+  #   relay-agent:
+  #     build:
+  #       context: .
+  #       dockerfile: balena/relay-agent/Dockerfile
+  #     restart: always
+  #     privileged: true
+  #     pid: host
+  #     network_mode: host
+  #     mem_limit: 64m
 
-  # Persistent SOCKS5 client so the device's OpenVPN (balenaCloud
-  # cloudlink) reaches the internet through the trojan tunnel, via
-  # balenaOS's own redsocks host-proxy instead of OpenVPN's own
-  # socks-proxy support, which does not reliably engage. Configures the
-  # host proxy itself at startup through the supervisor-api label below
-  # (PATCH /v1/device/host-config) -- no root, no privileged mode, safe
-  # to run on any device. Requires TROJAN_* env vars (device or fleet
-  # scoped): TROJAN_SERVER_ADDRESS, TROJAN_SERVER_PORT, TROJAN_PASSWORD,
-  # TROJAN_SNI.
-  #
-  # Does NOT fix OpenVPN's own proto (IPv6-first resolution can still
-  # hang connection attempts on networks with no IPv6 route) -- that fix
-  # requires editing /etc/openvpn/openvpn.conf directly, which has no
-  # non-root API. Rolled out to the canary (a03bf08, on an older release
-  # with relay-agent's host-root fix instead) and one additional device
-  # (empty-potato, 78d76b4) to verify the supervisor-api-only approach
-  # works before any wider fleet rollout.
+  # Persistent SOCKS5 client that gets balenaCloud cloudlink working on
+  # this network -- see balena/CLOUDLINK.md for the full explanation and
+  # the relay-agent-based host fix this depends on. Deployed fleet-wide;
+  # not privileged, safe on its own. Requires TROJAN_* env vars (device
+  # or fleet scoped): TROJAN_SERVER_ADDRESS, TROJAN_SERVER_PORT,
+  # TROJAN_PASSWORD, TROJAN_SNI.
   xray-cloudlink:
     build:
       context: .
@@ -95,21 +86,3 @@ services:
     mem_limit: 64m
     labels:
       io.balena.features.supervisor-api: '1'
-
-  # cloudlink-init (balena/cloudlink-init/Dockerfile) is intentionally NOT
-  # a service here, same reasoning as relay-agent above: it's privileged
-  # with host pid/network access, so it must only ever exist in a one-off
-  # release built and pinned to a specific device. empty-potato (78d76b4)
-  # is pinned to a release that has it baked in (c89aedaa...); that
-  # release is not touched by future fleet-wide pushes. To reuse it on
-  # another device, temporarily add this service back, push, and pin only
-  # that device to the resulting release:
-  #   cloudlink-init:
-  #     build:
-  #       context: .
-  #       dockerfile: balena/cloudlink-init/Dockerfile
-  #     restart: 'no'
-  #     privileged: true
-  #     pid: host
-  #     network_mode: host
-  #     mem_limit: 32m

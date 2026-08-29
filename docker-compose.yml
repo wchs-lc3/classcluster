@@ -66,13 +66,22 @@ services:
     network_mode: host
     mem_limit: 64m
 
-  # CANARY-ONLY. Persistent SOCKS5 client so the device's OpenVPN
-  # (balenaCloud cloudlink) reaches the internet through the trojan
-  # tunnel via balenaOS's own redsocks host-proxy (configured directly
-  # on the device at /mnt/boot/system-proxy, outside this repo) instead
-  # of relying on OpenVPN's own socks-proxy support, which does not
-  # reliably engage. Replaces a manually-launched nohup process that
-  # would not survive a reboot.
+  # Persistent SOCKS5 client so the device's OpenVPN (balenaCloud
+  # cloudlink) reaches the internet through the trojan tunnel, via
+  # balenaOS's own redsocks host-proxy instead of OpenVPN's own
+  # socks-proxy support, which does not reliably engage. Configures the
+  # host proxy itself at startup through the supervisor-api label below
+  # (PATCH /v1/device/host-config) -- no root, no privileged mode, safe
+  # to run on any device. Requires TROJAN_* env vars (device or fleet
+  # scoped): TROJAN_SERVER_ADDRESS, TROJAN_SERVER_PORT, TROJAN_PASSWORD,
+  # TROJAN_SNI.
+  #
+  # Does NOT fix OpenVPN's own proto (IPv6-first resolution can still
+  # hang connection attempts on networks with no IPv6 route) -- that fix
+  # requires editing /etc/openvpn/openvpn.conf directly, which has no
+  # non-root API. Currently rolled out to the canary (a03bf08) only
+  # while this gets verified on one additional device before any wider
+  # fleet rollout.
   xray-cloudlink:
     build:
       context: .
@@ -80,3 +89,5 @@ services:
     restart: always
     network_mode: host
     mem_limit: 64m
+    labels:
+      io.balena.features.supervisor-api: '1'

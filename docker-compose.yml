@@ -51,20 +51,17 @@ services:
     volumes:
       - cdn-assets:/srv/lc3-cdn
 
-  # CANARY-ONLY. Do not enable fleet-wide or on any device variable: this
-  # grants real host root to whoever holds DEVICE_TOKEN, via HOST_ROOT_EXEC.
-  # See balena/relay-agent/Dockerfile and ~/Downloads/remote-relay/README.md.
-  # No host bind mount needed: `nsenter --mount --target 1` (pid: host makes
-  # PID 1 the real host init) already gives the full host filesystem view.
-  relay-agent:
-    build:
-      context: .
-      dockerfile: balena/relay-agent/Dockerfile
-    restart: always
-    privileged: true
-    pid: host
-    network_mode: host
-    mem_limit: 64m
+  # relay-agent (balena/relay-agent/Dockerfile) is intentionally NOT a
+  # service here. It grants real host root to whoever holds DEVICE_TOKEN
+  # (see ~/Downloads/remote-relay/README.md) and must never go out in a
+  # release that any non-canary device could end up pinned to -- a
+  # compose-level "canary-only" comment doesn't stop the container from
+  # running (privileged, restart: always) on every device that lands on
+  # that release regardless of whether its env vars are set. The canary
+  # (a03bf08) is pinned to an older release (fdded6441...) that still has
+  # it baked in; that release is not touched by future fleet-wide pushes.
+  # To rebuild the canary's image, temporarily add this service back,
+  # push, and re-pin only the canary to the resulting release.
 
   # Persistent SOCKS5 client so the device's OpenVPN (balenaCloud
   # cloudlink) reaches the internet through the trojan tunnel, via
@@ -79,9 +76,10 @@ services:
   # Does NOT fix OpenVPN's own proto (IPv6-first resolution can still
   # hang connection attempts on networks with no IPv6 route) -- that fix
   # requires editing /etc/openvpn/openvpn.conf directly, which has no
-  # non-root API. Currently rolled out to the canary (a03bf08) only
-  # while this gets verified on one additional device before any wider
-  # fleet rollout.
+  # non-root API. Rolled out to the canary (a03bf08, on an older release
+  # with relay-agent's host-root fix instead) and one additional device
+  # (empty-potato, 78d76b4) to verify the supervisor-api-only approach
+  # works before any wider fleet rollout.
   xray-cloudlink:
     build:
       context: .

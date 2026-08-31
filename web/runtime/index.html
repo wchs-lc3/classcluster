@@ -93,6 +93,12 @@ bc.onmessage = (ev) => {
     if (handledRuns.has(m.runId)) return;
     handledRuns.add(m.runId);
     ensureWorker().postMessage({ cmd: 'run', runId: m.runId, path: m.path });
+  } else if (m.t === 'debug') {
+    // Same worker, same run path; the difference is the trace hook it attaches.
+    if (handledRuns.has(m.runId)) return;
+    handledRuns.add(m.runId);
+    ensureWorker().postMessage({
+      cmd: 'debug', runId: m.runId, path: m.path, breakpoints: m.breakpoints });
   } else if (m.t === 'check') {
     if (m.lang === 'java') checkJava(m.path);
     else ensureWorker().postMessage({ cmd: 'check', path: m.path });

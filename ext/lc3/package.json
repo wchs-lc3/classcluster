@@ -20,6 +20,7 @@
     },
     "commands": [
       { "command": "lc3.run", "title": "Run Program", "category": "LC3", "icon": "$(play)" },
+      { "command": "lc3.debug", "title": "Debug Program", "category": "LC3", "icon": "$(debug-alt)" },
       { "command": "lc3.submit", "title": "Submit for Grading", "category": "LC3", "icon": "$(rocket)" },
       { "command": "lc3.format", "title": "Format Code", "category": "LC3", "icon": "$(list-flat)" },
       { "command": "lc3.refresh", "title": "Refresh Files", "category": "LC3", "icon": "$(refresh)" },
@@ -42,7 +43,8 @@
       { "command": "lc3.publishAssignment", "title": "Publish", "category": "LC3", "icon": "$(broadcast)" },
       { "command": "lc3.unpublishAssignment", "title": "Unpublish", "category": "LC3", "icon": "$(eye-closed)" },
       { "command": "lc3.recallAssignment", "title": "Recall Submissions", "category": "LC3", "icon": "$(cloud-download)" },
-      { "command": "lc3.gradeAssignment", "title": "Grade Submissions", "category": "LC3", "icon": "$(checklist)" },
+      { "command": "lc3.reviewSubmissions", "title": "Read Submissions", "category": "LC3", "icon": "$(checklist)" },
+      { "command": "lc3.assignmentSettings", "title": "Due Date and Pasting", "category": "LC3", "icon": "$(calendar)" },
       { "command": "lc3.addWorker", "title": "Add Worker", "category": "LC3", "icon": "$(add)" },
       { "command": "lc3.recheckWorkers", "title": "Recheck Workers", "category": "LC3", "icon": "$(sync)" },
       { "command": "lc3.deleteWorker", "title": "Remove Worker", "category": "LC3", "icon": "$(trash)" },
@@ -51,8 +53,9 @@
     "menus": {
       "editor/title": [
         { "command": "lc3.run", "group": "navigation@1", "when": "resourceExtname == .py || resourceExtname == .java" },
-        { "command": "lc3.submit", "group": "navigation@2", "when": "resourceScheme == lc3" },
-        { "command": "lc3.format", "group": "navigation@3", "when": "resourceExtname == .py || resourceExtname == .java" }
+        { "command": "lc3.debug", "group": "navigation@2", "when": "resourceExtname == .py" },
+        { "command": "lc3.submit", "group": "navigation@3", "when": "resourceScheme == lc3" },
+        { "command": "lc3.format", "group": "navigation@4", "when": "resourceExtname == .py || resourceExtname == .java" }
       ],
       "view/title": [
         { "command": "lc3.admin.refresh", "when": "view == lc3.admin", "group": "navigation" }
@@ -72,7 +75,8 @@
         { "command": "lc3.setStudentClass", "when": "view == lc3.admin && viewItem == student", "group": "inline" },
         { "command": "lc3.resetPassword", "when": "view == lc3.admin && viewItem == student", "group": "inline" },
         { "command": "lc3.deleteStudent", "when": "view == lc3.admin && viewItem == student", "group": "inline" },
-        { "command": "lc3.gradeAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
+        { "command": "lc3.reviewSubmissions", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
+        { "command": "lc3.assignmentSettings", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
         { "command": "lc3.recallAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
         { "command": "lc3.publishAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
         { "command": "lc3.unpublishAssignment", "when": "view == lc3.admin && viewItem == assignment", "group": "inline" },
@@ -82,8 +86,30 @@
       ]
     },
     "keybindings": [
-      { "command": "lc3.run", "key": "f5", "when": "editorTextFocus" },
-      { "command": "lc3.run", "key": "ctrl+enter", "when": "editorTextFocus" }
+      { "command": "lc3.run", "key": "f5", "when": "editorTextFocus && !inDebugMode" },
+      { "command": "lc3.run", "key": "ctrl+enter", "when": "editorTextFocus && !inDebugMode" },
+      { "command": "lc3.debug", "key": "ctrl+f5", "when": "editorTextFocus" }
+    ],
+    "breakpoints": [{ "language": "python" }],
+    "debuggers": [
+      {
+        "type": "lc3-python",
+        "label": "LC3 Python",
+        "languages": ["python"],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "The .py file to debug. Defaults to the open file."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          { "type": "lc3-python", "request": "launch", "name": "Debug this file" }
+        ]
+      }
     ]
   }
 }

@@ -59,18 +59,33 @@ retires the old one immediately.
   correct. Grading runs in a bwrap + systemd sandbox (no network, no filesystem
   beyond its job directory, memory and process caps, a hard timeout); the test
   source is deleted before student code runs, so it cannot read the answers.
+- Debugging Python: breakpoints, step in, over and out, the call stack, and the
+  values of variables while the program is stopped. It runs in the browser, on
+  the student's own machine, so a class debugging at once costs the cluster
+  nothing. Java is not debugged yet; run it instead.
+- Due dates: an assignment can carry one. Work handed in after it is still
+  graded and still reaches the teacher, marked late; the student is told at the
+  moment they submit. Closing an assignment for real is Unpublish, which stays a
+  decision the teacher makes rather than something a clock does.
+- Pasting can be turned off per assignment, for the exercise where typing it out
+  is the point. Students can still copy and paste within their own files.
 - Joining a class: a code per class, sign-ups opened and closed by the teacher,
   and accounts students create themselves. A wrong code is refused without
   saying whether it was the code or a closed class that was wrong, and an
   address that keeps guessing stops being answered.
-- Teacher grading portal: the grade is the teacher's, not the tests'. From the
-  Class Management view the teacher recalls an assignment (snapshots every
-  student's code), reads it read-only, and records a score and comment. Publish
-  and unpublish open and close an assignment; unpublished work stays for grading.
+- Reading the class's work: from the Class Management view the teacher recalls
+  an assignment, which snapshots every student's code, and reads it read-only
+  alongside how that student's last submission scored against the tests. The
+  grade itself goes in the school's gradebook; this device stores no scores and
+  no comments. Publish and unpublish open and close an assignment; unpublished
+  work stays readable.
 - Authoring on the device: the teacher can run both Python and Java, write an
   assignment's `starter/` and `tests/` in their own files, and turn that folder
   into a published assignment without any external zip tool (or upload a zip).
-  Assignments can be deleted, and student passwords reset, from the same view.
+  What the assignment is, when it is due, and whether it takes pastes live in an
+  `assignment.yaml` beside those folders, and the due date and the paste setting
+  can also be changed later from the Class Management view. Assignments can be
+  deleted, and student passwords reset, from the same view.
 - Start from a working assignment: New Assignment from Template drops a small
   assignment into the teacher's files that already passes, with the starter
   students receive, the private tests, and a worked answer to check them
@@ -78,7 +93,7 @@ retires the old one immediately.
 - Rehearse before publishing: a teacher pressing Submit runs the starter against
   the tests through the same grading path a student's submission takes, on the
   same workers, so what they see is what the class will see. A teacher's run is
-  not recorded as a grade.
+  not recorded as a submission.
 - Cluster distribution: grading and interactive runs go to the Pi 3 workers
   first; the gateway's own runner is used last. Adding a Pi 3 from the admin
   view provisions it over SSH and expands the pool; a Pi flashed with the
@@ -114,6 +129,17 @@ knows. Leave it unset if you do not want it.
   Java compile errors come from the cluster's `javac` when you Run.
 - Submit returns test names and pass/fail only. Students see compile and runtime
   errors through Run, not Submit.
+- Debugging is Python only. There is no Java debugger; a Java program is run and
+  read instead. The Python debugger stops on breakpoints and on steps, not on an
+  uncaught exception, and it cannot interrupt a program that is already running:
+  set the breakpoint before starting it.
+- Turning pasting off is a speed bump, not a boundary. It refuses clipboard
+  content that was not copied inside the editor, which stops the paste from a
+  browser tab or a phone; a student who opens the browser's developer tools can
+  get around it. Treat it as a nudge for an exercise, not as exam control.
+- The device stores no grades. Scores and comments belong in the school's
+  gradebook; a database written before this stops being true has its grades
+  deleted the first time the gateway starts.
 - Student code and the private tests run in one process during grading. Deleting
   the test source blocks reading it from disk, but a very advanced student could
   still introspect in-memory objects; closing that fully needs out-of-process

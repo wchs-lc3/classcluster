@@ -347,6 +347,47 @@ function activeLc3File() {
   return ed.document.uri.path;
 }
 
+// The assignment a path belongs to is its first folder: /hello-py/main.py.
+function assignmentOf(path) {
+  return path ? (path.split('/').filter(Boolean)[0] || '') : '';
+}
+
+function dueText(unix) {
+  if (!unix) return '';
+  const d = new Date(unix * 1000);
+  const two = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate()) +
+    ' ' + two(d.getHours()) + ':' + two(d.getMinutes());
+}
+
+/* ---------------------------- paste policy ------------------------------- */
+// An assignment can be set to refuse pasted code. The editor is a page, not an
+// extension, so the block itself lives in index.html; all this does is tell the
+// page which rule applies to the file the student is looking at now.
+
+const assignments = new Map(); // id -> { due, no_paste }
+let pastePolicy = null;        // last value published, to avoid needless posts
+
+async function refreshAssignments() {
+  try {
+    const j = await getJSON('/api/assignments');
+    assignments.clear();
+    for (const a of (j.assignments || [])) assignments.set(a.id, a);
+  } catch (e) { /* keep whatever was known */ }
+  publishPastePolicy();
+}
+
+function publishPastePolicy() {
+  if (!bc) return;
+  // A teacher writes assignments, including by pasting one in, so the rule is
+  // for students only.
+  const a = assignments.get(assignmentOf(activeLc3File()));
+  const block = me.role !== 'teacher' && !!(a && a.no_paste);
+  if (block === pastePolicy) return;
+  pastePolicy = block;
+  bc.postMessage({ t: 'paste-policy', block });
+}
+
 function langFor(path) {
   // The file decides how it runs. The class language only chooses which engine
   // is preloaded; the runtime loads the other on demand if a file needs it.
@@ -355,7 +396,7 @@ function langFor(path) {
   return me.lang || 'python';
 }
 
-function parseJavacDiags(text, entry) {
+function parseJavacDiags(text) {
   // e.g. Greeter.java:5: error: ';' expected
   const diags = [];
   const re = /(^|\n)([\w./$-]+\.java):(\d+): (error|warning): ([^\n]*)/g;
@@ -383,7 +424,7 @@ async function runJavaCluster(path, pty) {
   if (r.status === 'busy') { pty.dim('all runners are busy right now; try again in a moment'); return; }
   if (r.status === 'compile_error') {
     pty.write((r.output || 'compile error') + '\n');
-    applyDiags(path, parseJavacDiags(r.output || '', path.split('/').pop()));
+    applyDiags(path, parseJavacDiags(r.output || ''));
     pty.dim('[compile error]'); return;
   }
   if (r.status !== 'running') { pty.dim('could not start the program'); return; }
@@ -480,6 +521,14 @@ async function submitCommand() {
         pty.raw((t.passed ? '\x1b[32m  PASS  \x1b[0m' : '\x1b[31m  FAIL  \x1b[0m') + t.name + '\r\n');
       }
       pty.dim('result: ' + r.passed + ' passed, ' + r.failed + ' failed  (status: ' + r.status + ')');
+      // A late submission still counts and still reaches the teacher; saying so
+      // here is the only place the student learns the deadline has passed.
+      if (r.late) {
+        pty.raw('\x1b[33m  submitted after the due date (' + dueText(r.due) + ')\x1b[0m\r\n');
+        vscode.window.showWarningMessage(
+          assignment + ': submitted after the due date (' + dueText(r.due) +
+          '). Your teacher can see that it was late.');
+      }
       const whose = r.dry_run ? 'the starter' : 'your code';
       if (r.status === 'compile_error') {
         vscode.window.showErrorMessage(assignment + ': ' + whose + ' does not compile. Use Run to see details.');
@@ -491,6 +540,302 @@ async function submitCommand() {
         vscode.window.showWarningMessage(assignment + ': ' + r.passed + ' passed, ' + r.failed + ' failed.');
       }
     });
+}
+
+/* ------------------------------- debugger -------------------------------- */
+// Python debugging, in the browser. The program runs where it always runs, in
+// the Pyodide worker; a trace hook there stops it on a breakpoint and reports
+// the frames it is standing in. Because that worker blocks while it waits, the
+// conversation cannot go over postMessage: the worker's answers come back
+// through the gateway relay, and this side polls for them.
+//
+// The adapter is inline (no debug server process; there is nowhere to run one),
+// and it speaks Debug Adapter Protocol straight to the workbench.
+
+let debugSession = null; // the one running session, if any
+
+// The workbench identifies a file in the student's storage as an lc3: URI, and
+// the protocol carries it as a string, so paths arrive as "lc3:/hello-py/x.py"
+// and have to go back out the same way.
+function pathFromSource(p) {
+  if (!p) return '';
+  const colon = p.indexOf(':');
+  if (colon > 0 && /^[a-zA-Z][a-zA-Z0-9+.-]*$/.test(p.slice(0, colon))) return p.slice(colon + 1);
+  return p;
+}
+
+class Lc3PythonDebug {
+  constructor() {
+    this.sendEmitter = new vscode.EventEmitter();
+    this.onDidSendMessage = this.sendEmitter.event;
+    this.runId = 'dbg' + rid();
+    this.seq = 1;
+    this.breakpoints = new Map(); // path -> [line]
+    this.program = null;
+    this.launched = false;
+    this.configured = false;
+    this.running = false;
+    this.alive = true;
+    this.stopped = null;          // the last state the program reported
+    this.variables = new Map();   // variablesReference -> [variable]
+    this.nextRef = 1;
+    this.evalWaiters = new Map();
+  }
+
+  /* ---- plumbing ---- */
+
+  send(msg) { msg.seq = this.seq++; this.sendEmitter.fire(msg); }
+  event(event, body) { this.send({ type: 'event', event, body: body || {} }); }
+  respond(req, body) {
+    this.send({ type: 'response', request_seq: req.seq, success: true, command: req.command, body: body || {} });
+  }
+  fail(req, message) {
+    this.send({ type: 'response', request_seq: req.seq, success: false, command: req.command, message });
+  }
+
+  // Tell the paused program what to do next.
+  command(cmd) {
+    req('POST', '/api/run/debug/command?run=' + encodeURIComponent(this.runId), cmd);
+  }
+
+  async handleMessage(message) {
+    if (message.type !== 'request') return;
+    try { await this.request(message); }
+    catch (e) { this.fail(message, String((e && e.message) || e)); }
+  }
+
+  async request(req_) {
+    switch (req_.command) {
+      case 'initialize':
+        this.respond(req_, {
+          supportsConfigurationDoneRequest: true,
+          supportsEvaluateForHovers: true,
+          supportsTerminateRequest: true,
+        });
+        this.event('initialized');
+        return;
+      case 'launch':
+        this.program = (req_.arguments || {}).program || activeLc3File();
+        this.launched = true;
+        this.respond(req_);
+        this.maybeStart();
+        return;
+      case 'setBreakpoints': {
+        const args = req_.arguments || {};
+        const path = pathFromSource((args.source || {}).path);
+        const lines = (args.breakpoints || []).map((b) => b.line);
+        this.breakpoints.set(path, lines);
+        // Breakpoints set while the program is already running still count.
+        if (this.running) this.command({ cmd: 'breakpoints', breakpoints: this.allBreakpoints() });
+        this.respond(req_, { breakpoints: lines.map((line) => ({ verified: true, line })) });
+        return;
+      }
+      case 'configurationDone':
+        this.configured = true;
+        this.respond(req_);
+        this.maybeStart();
+        return;
+      case 'threads':
+        this.respond(req_, { threads: [{ id: 1, name: 'python' }] });
+        return;
+      case 'stackTrace': {
+        const frames = (this.stopped ? this.stopped.frames : []).map((f) => ({
+          id: f.id,
+          name: f.name,
+          line: f.line,
+          column: 1,
+          source: {
+            name: (f.path || '').split('/').pop() || (this.program || '').split('/').pop(),
+            path: 'lc3:' + (f.path ? this.editorPath(f.path) : this.program),
+          },
+        }));
+        this.respond(req_, { stackFrames: frames, totalFrames: frames.length });
+        return;
+      }
+      case 'scopes': {
+        const frame = (this.stopped ? this.stopped.frames : [])
+          .find((f) => f.id === (req_.arguments || {}).frameId);
+        const scopes = [];
+        if (frame) {
+          scopes.push({ name: 'Locals', variablesReference: this.storeVars(frame.locals), expensive: false });
+          scopes.push({ name: 'Globals', variablesReference: this.storeVars(frame.globals), expensive: false });
+        }
+        this.respond(req_, { scopes });
+        return;
+      }
+      case 'variables':
+        this.respond(req_, { variables: this.variables.get((req_.arguments || {}).variablesReference) || [] });
+        return;
+      case 'continue':
+        this.resume({ cmd: 'continue' });
+        this.respond(req_, { allThreadsContinued: true });
+        return;
+      case 'next':
+        this.resume({ cmd: 'next' });
+        this.respond(req_);
+        return;
+      case 'stepIn':
+        this.resume({ cmd: 'stepIn' });
+        this.respond(req_);
+        return;
+      case 'stepOut':
+        this.resume({ cmd: 'stepOut' });
+        this.respond(req_);
+        return;
+      case 'evaluate': {
+        const args = req_.arguments || {};
+        const value = await this.evaluate(args.expression, args.frameId);
+        if (value == null) { this.fail(req_, 'not available'); return; }
+        this.respond(req_, { result: value.value, type: value.type, variablesReference: this.storeVars(value.children) });
+        return;
+      }
+      case 'disconnect':
+      case 'terminate':
+        this.stop();
+        this.respond(req_);
+        return;
+      default:
+        this.respond(req_);
+    }
+  }
+
+  // The program runs from a copy of its own folder, so breakpoints travel as
+  // paths relative to that folder ("main.py", "shapes/circle.py"). Breakpoints
+  // in files outside it belong to another program and are left behind.
+  allBreakpoints() {
+    const folder = (this.program || '').slice(0, (this.program || '').lastIndexOf('/') + 1);
+    const out = {};
+    for (const [path, lines] of this.breakpoints) {
+      if (!lines.length || !path.startsWith(folder)) continue;
+      out[path.slice(folder.length)] = lines;
+    }
+    return out;
+  }
+
+  // ...and come back the same way, as a path this editor can open.
+  editorPath(rel) {
+    const folder = (this.program || '').slice(0, (this.program || '').lastIndexOf('/') + 1);
+    return folder + rel;
+  }
+
+  storeVars(list) {
+    if (!list || !list.length) return 0;
+    const ref = ++this.nextRef;
+    this.variables.set(ref, list.map((v) => ({
+      name: v.name,
+      value: v.value,
+      type: v.type,
+      variablesReference: this.storeVars(v.children),
+    })));
+    return ref;
+  }
+
+  /* ---- the run itself ---- */
+
+  maybeStart() {
+    if (!this.launched || !this.configured || this.running) return;
+    if (!this.program) { this.exited('no file to debug'); return; }
+    if (!bc) { this.exited('the Python runtime is not loaded; reload the page'); return; }
+    this.running = true;
+    const { ui, pty } = getTerminal();
+    ui.show();
+    stopActiveRun();
+    pty.raw('\r\n\x1b[1m$ debug ' + this.program.split('/').pop() + '\x1b[0m\r\n');
+    // Debugging is a run: its output and its input() go to the same terminal.
+    pty.runId = this.runId; pty.mode = 'run';
+    bc.postMessage({
+      t: 'debug', runId: this.runId, lang: 'python',
+      path: this.program, breakpoints: this.allBreakpoints(),
+    });
+    this.poll();
+  }
+
+  resume(cmd) {
+    this.stopped = null;
+    this.variables.clear();
+    this.command(cmd);
+    this.event('continued', { threadId: 1, allThreadsContinued: true });
+  }
+
+  async evaluate(expression, frameId) {
+    if (!this.stopped || !expression) return null;
+    const reqId = rid();
+    const waiter = new Promise((resolve) => {
+      const timer = setTimeout(() => { this.evalWaiters.delete(reqId); resolve(null); }, 10000);
+      this.evalWaiters.set(reqId, (v) => { clearTimeout(timer); resolve(v); });
+    });
+    this.command({ cmd: 'evaluate', reqId, expression, frameId });
+    return waiter;
+  }
+
+  // Everything the program has to say arrives here, one long poll at a time.
+  async poll() {
+    while (this.alive) {
+      let resp;
+      try {
+        resp = await req('GET', '/api/run/debug/events?run=' + encodeURIComponent(this.runId));
+      } catch (e) { this.exited('lost contact with the program'); return; }
+      if (!this.alive) return;
+      if (!resp.ok) { this.exited('the runtime stopped answering'); return; }
+      if (resp.status === 204) continue; // nothing yet; ask again
+      let m;
+      try { m = await resp.json(); } catch (e) { continue; }
+      if (m.t === 'stopped') {
+        this.stopped = m;
+        this.variables.clear();
+        this.event('stopped', { reason: m.reason || 'step', threadId: 1, allThreadsStopped: true });
+      } else if (m.t === 'eval') {
+        const cb = this.evalWaiters.get(m.reqId);
+        if (cb) { this.evalWaiters.delete(m.reqId); cb(m.value); }
+      } else if (m.t === 'exit') {
+        this.exited(null, m.code);
+        return;
+      }
+    }
+  }
+
+  exited(message, code) {
+    if (!this.alive) return;
+    this.alive = false;
+    if (message) vscode.window.showWarningMessage('LC3 debug: ' + message);
+    this.event('exited', { exitCode: code || 0 });
+    this.event('terminated');
+  }
+
+  stop() {
+    if (!this.alive) { this.cleanup(); return; }
+    this.alive = false;
+    // A paused program takes the command and unwinds cleanly. One that is
+    // running is not listening, so the runtime is torn down under it, the same
+    // way Ctrl+C stops a runaway loop.
+    this.command({ cmd: 'stop' });
+    if (bc) bc.postMessage({ t: 'stop' });
+    this.cleanup();
+  }
+
+  cleanup() {
+    req('POST', '/api/run/debug/command?run=' + encodeURIComponent(this.runId) + '&end=1');
+    if (termInstance && termInstance.runId === this.runId) {
+      termInstance.runId = null; termInstance.mode = 'idle';
+    }
+    if (debugSession === this) debugSession = null;
+  }
+
+  dispose() { this.stop(); }
+}
+
+async function debugCommand() {
+  const path = activeLc3File();
+  if (!path) { vscode.window.showWarningMessage('Open a .py file to debug.'); return; }
+  if (path.endsWith('.java')) {
+    vscode.window.showWarningMessage(
+      'Debugging is Python only for now. Run the Java file instead (F5).');
+    return;
+  }
+  await vscode.workspace.saveAll(false);
+  await vscode.debug.startDebugging(undefined, {
+    type: 'lc3-python', request: 'launch', name: path.split('/').pop(), program: path,
+  });
 }
 
 /* ----------------------------- diagnostics ------------------------------- */
@@ -530,10 +875,15 @@ function onRuntimeMessage(ev) {
     } else if (m.t === 'exit') {
       t.dim('[finished, exit code ' + m.code + ']');
       t.runId = null; t.mode = 'idle';
+      // A debug session ends when its program does.
+      if (debugSession && debugSession.runId === m.runId) debugSession.exited(null, m.code);
     }
     return;
   }
-  if (m.t === 'diags') {
+  if (m.t === 'paste-policy-request') {
+    pastePolicy = null; // the page has just started; tell it either way
+    publishPastePolicy();
+  } else if (m.t === 'diags') {
     applyDiags(m.path, m.diags);
   } else if (m.t === 'formatted') {
     const cb = runtimePending.get(m.reqId);
@@ -660,9 +1010,16 @@ class AdminTree {
         return (j.assignments || []).map((a) => {
           const it = new vscode.TreeItem(a.id);
           it.description = (a.classes || []).join(', ') + '  ·  ' + a.language +
+            (a.due ? '  ·  due ' + dueText(a.due) : '') +
+            (a.no_paste ? '  ·  no paste' : '') +
             (a.closed ? '  ·  closed' : '');
           it.contextValue = 'assignment'; it.lc3 = a;
           it.iconPath = new vscode.ThemeIcon(a.closed ? 'lock' : 'book');
+          it.tooltip = new vscode.MarkdownString(
+            '**' + a.id + '**  ' + (a.title || '') + '\n\n' +
+            'classes: ' + ((a.classes || []).join(', ') || '(none)') + '\n\n' +
+            'due: ' + (a.due ? dueText(a.due) : 'no due date') + '\n\n' +
+            'pasting: ' + (a.no_paste ? 'blocked for students' : 'allowed'));
           return it;
         });
       }
@@ -682,7 +1039,8 @@ class AdminTree {
         const j = await getJSON('/api/admin/submissions');
         return (j.submissions || []).slice(0, 50).map((s) => {
           const it = new vscode.TreeItem(s.username + ' · ' + s.assignment);
-          it.description = s.passed + '/' + (s.passed + s.failed) + '  (' + s.status + ')';
+          it.description = s.passed + '/' + (s.passed + s.failed) + '  (' + s.status + ')' +
+            (s.late ? '  ·  late' : '');
           it.contextValue = 'submission';
           it.iconPath = new vscode.ThemeIcon(s.failed === 0 && s.passed > 0 ? 'pass' : 'warning');
           return it;
@@ -880,7 +1238,7 @@ function registerAdmin(context) {
         if (!uris || !uris.length) return;
         const bytes = await vscode.workspace.fs.readFile(uris[0]);
         const id = await vscode.window.showInputBox({
-          prompt: 'Assignment id (leave blank to use assignment.json in the zip)' });
+          prompt: 'Assignment id (leave blank to use assignment.yaml in the zip)' });
         if (id === undefined) return;
         const j = await postJSON('/api/admin/assignments/upload',
           { classes, id: id.trim(), zip_b64: bytesToB64(bytes) });
@@ -913,43 +1271,70 @@ function registerAdmin(context) {
         vscode.window.showInformationMessage('LC3: recalled ' + j.collected + ' submissions for "' + id + '".');
       } catch (e) { adminError(e); }
     }),
-    vscode.commands.registerCommand('lc3.gradeAssignment', async (item) => {
+    // Reading the class's work, one student at a time. The score is written in
+    // the school's gradebook, not here: this device keeps no grades.
+    vscode.commands.registerCommand('lc3.reviewSubmissions', async (item) => {
       const id = item && item.lc3 && item.lc3.id; if (!id) return;
       try {
         await postJSON('/api/admin/assignments/recall', { id }); // fresh snapshot
         const col = await getJSON('/api/admin/collected?assignment=' + encodeURIComponent(id));
         const students = col.students || [];
         if (!students.length) {
-          vscode.window.showInformationMessage('LC3: no submissions to grade yet for "' + id + '".');
+          vscode.window.showInformationMessage('LC3: nothing submitted yet for "' + id + '".');
           return;
         }
-        // Grade students one by one until the teacher dismisses the picker.
+        const subs = (await getJSON('/api/admin/submissions')).submissions || [];
+        const latest = new Map();
+        for (const s of subs) {
+          if (s.assignment === id && !latest.has(s.username)) latest.set(s.username, s);
+        }
+        // One student at a time, until the teacher dismisses the picker.
         for (;;) {
           const pick = await vscode.window.showQuickPick(
-            students.map((s) => ({
-              label: s.username,
-              description: (s.score ? 'grade: ' + s.score : 'ungraded') +
-                '  ·  ' + (s.files.length ? s.files.length + ' files' : 'no work'),
-              s,
-            })),
-            { placeHolder: 'Grade "' + id + '" - pick a student (Esc when done)' });
+            students.map((s) => {
+              const sub = latest.get(s.username);
+              const tests = sub ? sub.passed + '/' + (sub.passed + sub.failed) + ' tests' : 'never submitted';
+              return {
+                label: s.username,
+                description: tests + (sub && sub.late ? '  ·  late' : '') +
+                  '  ·  ' + (s.files.length ? s.files.length + ' files' : 'no work'),
+                s,
+              };
+            }),
+            { placeHolder: 'Read "' + id + '" - pick a student (Esc when done)' });
           if (!pick) break;
-          const s = pick.s;
-          for (const f of s.files.slice(0, 8)) {
-            const uri = vscode.Uri.parse('lc3grade:/' + id + '/' + s.username + '/' + f);
+          for (const f of pick.s.files.slice(0, 8)) {
+            const uri = vscode.Uri.parse('lc3grade:/' + id + '/' + pick.s.username + '/' + f);
             const doc = await vscode.workspace.openTextDocument(uri);
             await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true });
           }
-          const score = await vscode.window.showInputBox(
-            { prompt: 'Grade for ' + s.username + ' on "' + id + '"', value: s.score || '' });
-          if (score === undefined) continue;
-          const comment = await vscode.window.showInputBox(
-            { prompt: 'Comment (optional)', value: s.comment || '' });
-          await postJSON('/api/admin/grade',
-            { assignment: id, username: s.username, score, comment: comment || '' });
-          s.score = score; s.comment = comment || '';
-          adminTree.refresh();
         }
+      } catch (e) { adminError(e); }
+    }),
+
+    // When an assignment is due, and whether students may paste into it.
+    vscode.commands.registerCommand('lc3.assignmentSettings', async (item) => {
+      const a = (item && item.lc3) || {};
+      if (!a.id) return;
+      try {
+        const due = await vscode.window.showInputBox({
+          prompt: 'Due date for "' + a.id + '" (2026-09-14 23:59, or a date on its own). Empty for none.',
+          value: a.due ? dueText(a.due) : '',
+          placeHolder: 'YYYY-MM-DD HH:MM',
+        });
+        if (due === undefined) return;
+        const paste = await vscode.window.showQuickPick(
+          [{ label: 'Pasting allowed', block: false },
+           { label: 'Block pasting from outside the editor', block: true,
+             description: 'students can still copy and paste within their own files' }],
+          { placeHolder: 'Pasting for "' + a.id + '"' });
+        if (!paste) return;
+        const j = await postJSON('/api/admin/assignments/settings',
+          { id: a.id, due: due.trim(), no_paste: paste.block });
+        adminTree.refresh();
+        vscode.window.showInformationMessage('LC3: "' + a.id + '" is ' +
+          (j.due ? 'due ' + dueText(j.due) : 'not due on a date') +
+          (j.no_paste ? ', pasting blocked.' : ', pasting allowed.'));
       } catch (e) { adminError(e); }
     }),
 
@@ -1075,8 +1460,37 @@ async function activate(context) {
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((closed) => forgetTerminal(closed)));
 
+  // Debugging: one inline adapter, and a launch configuration the student never
+  // has to write (there is no launch.json here, and no folder to keep one in).
+  context.subscriptions.push(
+    vscode.debug.registerDebugAdapterDescriptorFactory('lc3-python', {
+      createDebugAdapterDescriptor: () => {
+        debugSession = new Lc3PythonDebug();
+        return new vscode.DebugAdapterInlineImplementation(debugSession);
+      },
+    }),
+    vscode.debug.registerDebugConfigurationProvider('lc3-python', {
+      resolveDebugConfiguration: (folder, config) => {
+        if (!config.type) {
+          config.type = 'lc3-python'; config.request = 'launch'; config.name = 'Debug';
+        }
+        if (!config.program) config.program = activeLc3File();
+        return config;
+      },
+    }));
+
+  // Keep the page's paste rule in step with the file being looked at. Opening a
+  // file re-reads the list rather than trusting the cached one, so a rule the
+  // teacher changes mid-lesson applies at the next file the student opens.
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => refreshAssignments()));
+  refreshAssignments();
+  const policyTimer = setInterval(refreshAssignments, 60000);
+  context.subscriptions.push(new vscode.Disposable(() => clearInterval(policyTimer)));
+
   context.subscriptions.push(
     vscode.commands.registerCommand('lc3.run', runCommand),
+    vscode.commands.registerCommand('lc3.debug', debugCommand),
     vscode.commands.registerCommand('lc3.submit', submitCommand),
     vscode.commands.registerCommand('lc3.format', async () => {
       const ed = vscode.window.activeTextEditor;
@@ -1143,13 +1557,17 @@ async function activate(context) {
   const runItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
   runItem.text = '$(play) Run'; runItem.command = 'lc3.run';
   runItem.tooltip = 'Run the open file in the terminal (F5)'; runItem.show();
+  const dbgItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98.5);
+  dbgItem.text = '$(debug-alt) Debug'; dbgItem.command = 'lc3.debug';
+  dbgItem.tooltip = 'Debug the open Python file: breakpoints, step, variables';
+  dbgItem.show();
   const subItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
   subItem.text = '$(rocket) Submit'; subItem.command = 'lc3.submit';
   subItem.tooltip = 'Submit this assignment for grading'; subItem.show();
   const fmtItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 96);
   fmtItem.text = '$(list-flat) Format'; fmtItem.command = 'lc3.format';
   fmtItem.tooltip = 'Format the open file (black / prettier)'; fmtItem.show();
-  context.subscriptions.push(idItem, runItem, subItem, fmtItem);
+  context.subscriptions.push(idItem, runItem, dbgItem, subItem, fmtItem);
 
   if (me.role === 'teacher') {
     // Reveal the Class Management view container and wire up its actions.

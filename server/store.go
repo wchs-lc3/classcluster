@@ -28,8 +28,8 @@ type User struct {
 }
 
 // A class groups students who take one course. Its language decides which
-// single runtime a student loads (python -> Pyodide, java -> CheerpJ) and
-// which assignments they see.
+// single runtime a student loads (python -> Pyodide in the browser, java -> a
+// JVM on a runner) and which assignments they see.
 type Class struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -64,6 +64,7 @@ type Submission struct {
 	Status     string       `json:"status"`
 	Passed     int          `json:"passed"`
 	Failed     int          `json:"failed"`
+	Late       bool         `json:"late"`
 	Tests      []TestResult `json:"tests,omitempty"`
 }
 
@@ -99,23 +100,25 @@ CREATE TABLE IF NOT EXISTS workers (
     last_seen INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS submissions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, assignment TEXT,
-    ts INTEGER, status TEXT, passed INTEGER, failed INTEGER, tests TEXT);
-CREATE TABLE IF NOT EXISTS grades (
-    assignment TEXT, username TEXT, score TEXT, comment TEXT, ts INTEGER,
-    PRIMARY KEY(assignment, username));
+    ts INTEGER, status TEXT, passed INTEGER, failed INTEGER, tests TEXT,
+    late INTEGER NOT NULL DEFAULT 0);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
-	// Classes predating self-signup have neither column. Adding one that is
-	// already there is an error, and the only error worth reporting, so both
-	// are ignored: a fresh database gets them from the schema above.
+	// Columns added after the first release. Adding one that is already there is
+	// an error, and the only error worth reporting, so all are ignored: a fresh
+	// database gets them from the schema above.
 	for _, alter := range []string{
 		"ALTER TABLE classes ADD COLUMN code TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE classes ADD COLUMN signup_open INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE submissions ADD COLUMN late INTEGER NOT NULL DEFAULT 0",
 	} {
 		_, _ = db.Exec(alter)
 	}
+	// Scores and comments are not kept on the device. A database written before
+	// that decision still holds them, so the table goes on the way past.
+	_, _ = db.Exec("DROP TABLE IF EXISTS grades")
 	return &Store{db: db}, nil
 }
 
@@ -426,9 +429,10 @@ func (s *Store) AllWorkers() []Worker {
 func (s *Store) AddSubmission(sub *Submission) int {
 	testsJSON, _ := json.Marshal(sub.Tests)
 	res, err := s.db.Exec(
-		"INSERT INTO submissions(username, assignment, ts, status, passed, failed, tests) "+
-			"VALUES(?,?,?,?,?,?,?)",
-		sub.Username, sub.Assignment, sub.Ts, sub.Status, sub.Passed, sub.Failed, string(testsJSON))
+		"INSERT INTO submissions(username, assignment, ts, status, passed, failed, tests, late) "+
+			"VALUES(?,?,?,?,?,?,?,?)",
+		sub.Username, sub.Assignment, sub.Ts, sub.Status, sub.Passed, sub.Failed,
+		string(testsJSON), boolInt(sub.Late))
 	if err != nil {
 		return 0
 	}
@@ -437,52 +441,14 @@ func (s *Store) AddSubmission(sub *Submission) int {
 	return sub.ID
 }
 
-// ---- grades ----
-
-type Grade struct {
-	Username string `json:"username"`
-	Score    string `json:"score"`
-	Comment  string `json:"comment"`
-	Ts       int64  `json:"ts"`
-}
-
-func (s *Store) PutGrade(assignment, username, score, comment string) {
-	_, _ = s.db.Exec(
-		"INSERT INTO grades(assignment, username, score, comment, ts) VALUES(?,?,?,?,?) "+
-			"ON CONFLICT(assignment, username) DO UPDATE SET score=excluded.score, "+
-			"comment=excluded.comment, ts=excluded.ts",
-		assignment, username, score, comment, time.Now().Unix())
-}
-
-func (s *Store) DeleteGrades(assignment string) {
-	_, _ = s.db.Exec("DELETE FROM grades WHERE assignment=?", assignment)
-}
-
 func (s *Store) SetPassword(username, password string) {
 	_, _ = s.db.Exec("UPDATE users SET pwhash=? WHERE username=?", HashPassword(password), username)
-}
-
-func (s *Store) GradesForAssignment(assignment string) map[string]Grade {
-	out := map[string]Grade{}
-	rows, err := s.db.Query(
-		"SELECT username, score, comment, ts FROM grades WHERE assignment=?", assignment)
-	if err != nil {
-		return out
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var g Grade
-		if rows.Scan(&g.Username, &g.Score, &g.Comment, &g.Ts) == nil {
-			out[g.Username] = g
-		}
-	}
-	return out
 }
 
 func (s *Store) RecentSubmissions(username string, limit int) []*Submission {
 	var rows *sql.Rows
 	var err error
-	q := "SELECT id, username, assignment, ts, status, passed, failed, tests FROM submissions "
+	q := "SELECT id, username, assignment, ts, status, passed, failed, tests, late FROM submissions "
 	if username == "" {
 		rows, err = s.db.Query(q+"ORDER BY id DESC LIMIT ?", limit)
 	} else {
@@ -496,8 +462,10 @@ func (s *Store) RecentSubmissions(username string, limit int) []*Submission {
 	for rows.Next() {
 		sub := &Submission{}
 		var testsJSON string
+		var late int
 		if rows.Scan(&sub.ID, &sub.Username, &sub.Assignment, &sub.Ts, &sub.Status,
-			&sub.Passed, &sub.Failed, &testsJSON) == nil {
+			&sub.Passed, &sub.Failed, &testsJSON, &late) == nil {
+			sub.Late = late != 0
 			_ = json.Unmarshal([]byte(testsJSON), &sub.Tests)
 			out = append(out, sub)
 		}

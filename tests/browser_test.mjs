@@ -140,9 +140,11 @@ try {
         const a = li.querySelector('[aria-label]');
         return a && a.getAttribute('aria-label').startsWith(label) && li.offsetParent !== null;
       });
-      return shown('Explorer') && gone('Source Control') && gone('Run and Debug') && gone('Extensions') && gone('Search');
+      // Run and Debug stays: Variables, Watch, and the Call Stack live there.
+      return shown('Explorer') && shown('Run and Debug') &&
+        gone('Source Control') && gone('Extensions') && gone('Search');
     }, { timeout: 15000 });
-    ok('activity bar trimmed (Explorer only; no SCM/Debug/Extensions/Search)');
+    ok('activity bar trimmed (Explorer and Run and Debug; no SCM/Extensions/Search)');
   } catch (e) { bad('activity bar not trimmed: ' + e.message); }
 
   // --- hidden runtime iframe present, only the python engine ---
@@ -303,6 +305,111 @@ try {
     if (/HI_STALEZoe/.test(t2)) bad('stale pre-run input leaked into input(): ' + t2.slice(-120));
     else ok('input typed before Run is discarded, not fed to input()');
   } catch (e) { bad('python terminal input failed: ' + e.message); }
+
+  // --- Python debugging: breakpoint stops the program, continue finishes it ---
+  try {
+    const termText = () => page.evaluate(() =>
+      [...document.querySelectorAll('.xterm-rows')].map(x => x.innerText).join(' '));
+    const findRow = async (t) => (await page.evaluateHandle((n) =>
+      [...document.querySelectorAll('.monaco-list-row')].find(r => r.innerText.trim() === n), t)).asElement();
+    await page.evaluate(async () => {
+      await fetch('/api/fs/write?path=/dbgdemo.py', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: 'total = 0\nfor i in range(4):\n    total = total + i\nprint("DEBUG_DONE_" + str(total))\n',
+      });
+    });
+    await paletteRun(page, 'LC3: Refresh Files');
+    let row = null;
+    for (let i = 0; i < 20 && !row; i++) { row = await findRow('dbgdemo.py'); if (!row) await new Promise(r => setTimeout(r, 600)); }
+    if (!row) throw new Error('dbgdemo.py did not appear');
+    await row.click(); await new Promise(r => setTimeout(r, 400));
+    await page.keyboard.press('Enter'); await new Promise(r => setTimeout(r, 1500));
+    // Put the cursor on the print and break there, so the loop has run first.
+    await paletteRun(page, 'Go to Line/Column');
+    await page.keyboard.type('4'); await page.keyboard.press('Enter');
+    await new Promise(r => setTimeout(r, 500));
+    await paletteRun(page, 'Debug: Toggle Breakpoint');
+    await new Promise(r => setTimeout(r, 500));
+    await paletteRun(page, 'LC3: Debug Program');
+    await page.waitForSelector('.debug-toolbar', { timeout: 90000 });
+    // Stopped at the breakpoint: the editor marks the line it is standing on,
+    // which only happens once the frame's source resolves to a file this
+    // workbench can open. The print on that line has not run yet.
+    await page.waitForSelector('.debug-top-stack-frame-line, .debug-top-stack-frame', { timeout: 60000 });
+    const stoppedText = await termText();
+    if (!/DEBUG_DONE/.test(stoppedText)) ok('the debugger stops the program at a breakpoint');
+    else bad('the program ran past its breakpoint: ' + stoppedText.slice(-120));
+    // The frame it stopped in carries the variables of that frame.
+    await paletteRun(page, 'View: Show Run and Debug');
+    await new Promise(r => setTimeout(r, 2000));
+    const vars = await page.evaluate(() =>
+      [...document.querySelectorAll('.monaco-list-row')].map(el => el.innerText.replace(/\s+/g, ' ').trim()).join(' | '));
+    if (/total/.test(vars)) ok('the Variables view shows the stopped frame');
+    else bad('no variables shown while stopped: ' + vars.slice(0, 200));
+    // F5 while paused must continue the program, not start a second run of it.
+    await page.evaluate(() => document.querySelector('.monaco-editor textarea')?.focus());
+    await page.keyboard.press('F5');
+    await page.waitForFunction(
+      () => /DEBUG_DONE_6/.test([...document.querySelectorAll('.xterm-rows')].map(x => x.innerText).join(' ')),
+      { timeout: 60000 });
+    ok('continuing from the breakpoint runs the program to the end');
+  } catch (e) { bad('python debugging failed: ' + e.message); }
+
+  // --- pasting: blocked for an assignment set that way, allowed otherwise ---
+  try {
+    // Turn the rule on for the student's assignment. This is driven from node,
+    // not from the page: signing in as the teacher there would take the
+    // student's own session with it.
+    const login = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'teacher', password: 'lc3teach' }) });
+    const cookie = (login.headers.get('set-cookie') || '').split(';')[0];
+    await fetch(BASE + '/api/admin/assignments/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ id: 'hello-py', no_paste: true, due: '' }) });
+
+    // Open a file inside that assignment so the rule applies to it.
+    const findRow = async (t) => (await page.evaluateHandle((n) =>
+      [...document.querySelectorAll('.monaco-list-row')].find(r => r.innerText.trim() === n), t)).asElement();
+    await paletteRun(page, 'LC3: Refresh Files');
+    let folder = null;
+    for (let i = 0; i < 20 && !folder; i++) { folder = await findRow('hello-py'); if (!folder) await new Promise(r => setTimeout(r, 600)); }
+    if (!folder) throw new Error('hello-py folder did not appear');
+    // ArrowRight expands a tree row; Enter on a folder is not reliable headless.
+    await folder.click(); await page.keyboard.press('ArrowRight');
+    await new Promise(r => setTimeout(r, 1500));
+    let file = null;
+    for (let i = 0; i < 20 && !file; i++) { file = await findRow('main.py'); if (!file) await new Promise(r => setTimeout(r, 600)); }
+    if (!file) throw new Error('main.py did not appear');
+    await file.click(); await page.keyboard.press('Enter'); await new Promise(r => setTimeout(r, 3000));
+
+    // Text copied inside the workbench carries the editor's own clipboard type;
+    // text from anywhere else does not. The notice is what the page shows when
+    // it refuses, so it is the signal here: the editor itself calls
+    // preventDefault on every paste it handles, refused or not.
+    const tryPaste = (marked) => page.evaluate((mark) => {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', 'PASTED_FROM_OUTSIDE');
+      if (mark) dt.setData('vscode-editor-data', '{}');
+      const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+      (document.querySelector('.monaco-editor textarea') || document.querySelector('.monaco-workbench'))
+        .dispatchEvent(ev);
+    }, marked);
+    const refused = () => page.evaluate(() => /Pasting is off/.test(document.body.innerText));
+    await tryPaste(false);
+    if (await refused()) ok('pasting from outside is refused when the assignment says so');
+    else bad('an outside paste went through');
+    await new Promise(r => setTimeout(r, 3200)); // the notice clears itself
+    await tryPaste(true);
+    await new Promise(r => setTimeout(r, 500));
+    if (!await refused()) ok('code copied inside the editor still pastes');
+    else bad('an editor copy was refused too');
+
+    await fetch(BASE + '/api/admin/assignments/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ id: 'hello-py', no_paste: false, due: '' }) });
+  } catch (e) { bad('paste rule check failed: ' + e.message); }
 
   // --- Python formatting (black, in the browser, offline) ---
   try {

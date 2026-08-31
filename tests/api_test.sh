@@ -240,6 +240,27 @@ has "$(curl -s -b /tmp/lc3-jsb $BASE/api/assignments)" 'hello-py' "second-class 
 printf '{"classes":["cp3","apcsa"],"zip_b64":"%s"}' "$B64" > /tmp/lc3-mx.json
 has "$(curl -s -b $JT -H 'Content-Type: application/json' --data @/tmp/lc3-mx.json $BASE/api/admin/assignments/upload)" 'same language' "mixed-language classes rejected"
 
+echo "== teacher: a zip of the folder itself uploads too =="
+# Zipping a folder rather than its contents is what a file manager does by
+# default, and it used to produce an assignment with no tests in it.
+rm -rf /tmp/lc3-wrap && mkdir -p /tmp/lc3-wrap/wrapped
+python3 - <<'PY'
+import zipfile, os
+src = zipfile.ZipFile('examples/hello-py.zip')
+with zipfile.ZipFile('/tmp/lc3-wrap/wrapped.zip', 'w') as out:
+    for name in src.namelist():
+        data = src.read(name)
+        if name.endswith('assignment.yaml'):
+            data = data.replace(b'id: hello-py', b'id: wrapped')
+        out.writestr('wrapped/' + name, data)
+PY
+WB64=$(base64 -w0 /tmp/lc3-wrap/wrapped.zip)
+printf '{"classes":["cp3"],"zip_b64":"%s"}' "$WB64" > /tmp/lc3-wrapup.json
+has "$(curl -s -b $JT -H 'Content-Type: application/json' --data @/tmp/lc3-wrapup.json $BASE/api/admin/assignments/upload)" \
+    '"id":"wrapped"' "a zip with one wrapping folder is unwrapped"
+has "$(curl -s -b $J $BASE/api/assignments)" 'wrapped' "the unwrapped assignment reaches the student"
+tpost /api/admin/assignments/delete '{"id":"wrapped"}' >/dev/null
+
 echo "== teacher: reset password =="
 tpost /api/admin/students/setpassword '{"username":"demo","password":"newpw"}' >/dev/null
 chk "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d '{"username":"demo","password":"newpw"}' $BASE/api/login)" "200" "reset password lets the student log in"
@@ -268,15 +289,18 @@ has "$(curl -s -b $J $BASE/api/assignments)" 'mkasg' "authored assignment reache
 tpost /api/admin/assignments/delete '{"id":"mkasg"}' >/dev/null
 echo "$(curl -s -b $J $BASE/api/assignments)" | grep -q mkasg && bad "deleted assignment still visible" || ok "delete assignment removes it"
 
-echo "== teacher: grading portal (recall, read, grade, unpublish) =="
+echo "== teacher: reading submissions (recall, read, unpublish) =="
 curl -s -b $J -X POST --data-binary "def greet(name):
     return 'Hello, ' + name + '!'
 " "$BASE/api/fs/write?path=/hello-py/main.py" >/dev/null
 has "$(tpost /api/admin/assignments/recall '{"id":"hello-py"}')" '"collected"' "recall snapshots student code"
 has "$(curl -s -b $JT "$BASE/api/admin/collected?assignment=hello-py")" '"username":"demo"' "collected lists the student"
 has "$(curl -s -b $JT "$BASE/api/admin/collected/read?assignment=hello-py&user=demo&path=main.py")" 'greet' "teacher reads the student's actual code"
-tpost /api/admin/grade '{"assignment":"hello-py","username":"demo","score":"A","comment":"good"}' >/dev/null
-has "$(curl -s -b $JT "$BASE/api/admin/collected?assignment=hello-py")" '"score":"A"' "grade is recorded"
+# Scores are not kept on this device: there is nowhere to put one.
+col=$(curl -s -b $JT "$BASE/api/admin/collected?assignment=hello-py")
+echo "$col" | grep -q '"score"' && bad "collected still carries a score field" || ok "no grade is stored with the collected work"
+chk "$(curl -s -o /dev/null -w '%{http_code}' -b $JT -H 'Content-Type: application/json' \
+  -d '{"assignment":"hello-py","username":"demo","score":"A"}' $BASE/api/admin/grade)" "404" "the grade endpoint is gone"
 tpost /api/admin/assignments/unpublish '{"id":"hello-py"}' >/dev/null
 echo "$(curl -s -b $J "$BASE/api/fs/list?path=/")" | grep -q 'hello-py' && bad "unpublish left the folder in the student's files" || ok "unpublish removes the folder from the student's files"
 has "$(curl -s -b $JT $BASE/api/assignments)" '"closed":true' "teacher sees it as closed"
@@ -284,11 +308,54 @@ tpost /api/admin/assignments/publish '{"id":"hello-py"}' >/dev/null
 has "$(curl -s -b $J "$BASE/api/fs/list?path=/")" 'hello-py' "re-publish restores the folder in the student's files"
 
 echo "== teacher: moving a student's class swaps their visible assignments =="
+curl -s -b $J -X POST --data-binary "def greet(name):
+    return 'Hello, ' + name + '!'   # the work being carried across the move
+" "$BASE/api/fs/write?path=/hello-py/main.py" >/dev/null
 tpost /api/admin/students/setclass '{"username":"demo","class":"apcsa"}' >/dev/null
 dl=$(curl -s -b $J "$BASE/api/fs/list?path=/")
 has "$dl" 'hello-java' "moving demo to the java class adds the java assignment"
 echo "$dl" | grep -q 'hello-py' && bad "old python assignment still present after class switch" || ok "and removes the python assignment"
+# Taking the folder away must not throw the work away with it.
+has "$(curl -s -b $JT "$BASE/api/admin/collected/read?assignment=hello-py&user=demo&path=main.py")" \
+    'carried across the move' "work is snapshotted before a class move removes it"
 tpost /api/admin/students/setclass '{"username":"demo","class":"cp3"}' >/dev/null
+
+echo "== assignments: due dates and the paste setting =="
+has "$(tpost /api/admin/assignments/settings '{"id":"hello-py","due":"2020-01-02 09:00","no_paste":true}')" \
+    '"ok":true' "teacher sets a due date and blocks pasting"
+al=$(curl -s -b $J $BASE/api/assignments)
+has "$al" '"no_paste":true' "the student's assignment list carries the paste rule"
+has "$al" '"due":' "the student's assignment list carries the due date"
+has "$(tpost /api/admin/assignments/settings '{"id":"hello-py","due":"not a date"}')" \
+    'look like' "an unreadable due date is refused"
+# A due date that has passed marks the submission late; it is still graded.
+# (Re-publishing after the class-move check restored the unfinished starter.)
+curl -s -b $J -X POST --data-binary "def greet(name):
+    return 'Hello, ' + name + '!'
+" "$BASE/api/fs/write?path=/hello-py/main.py" >/dev/null
+res=$(curl -s -b $J -X POST -H 'Content-Type: application/json' -d '{"assignment":"hello-py"}' $BASE/api/submit)
+has "$res" '"late":true' "a submission after the due date is marked late"
+has "$res" '"passed":3' "and is still graded"
+has "$(curl -s -b $JT $BASE/api/admin/submissions)" '"late":true' "the teacher sees which submissions were late"
+tpost /api/admin/assignments/settings '{"id":"hello-py","due":"","no_paste":false}' >/dev/null
+res=$(curl -s -b $J -X POST -H 'Content-Type: application/json' -d '{"assignment":"hello-py"}' $BASE/api/submit)
+has "$res" '"late":false' "with the due date cleared, nothing is late"
+
+echo "== debug relay: the program waits, the editor answers =="
+# The pause request blocks until a command arrives, which is what lets a
+# breakpoint hold the program still.
+( sleep 1; curl -s -b $J -X POST -H 'Content-Type: application/json' \
+    -d '{"cmd":"next"}' "$BASE/api/run/debug/command?run=dbgtest" >/dev/null ) &
+paused=$(curl -s -b $J -X POST -H 'Content-Type: application/json' \
+    -d '{"t":"stopped","reason":"breakpoint"}' "$BASE/api/run/debug/pause?run=dbgtest")
+has "$paused" '"cmd":"next"' "a paused program is released by the editor's command"
+( sleep 1; curl -s -b $J -X POST -H 'Content-Type: application/json' \
+    -d '{"t":"stopped","reason":"step"}' "$BASE/api/run/debug/pause?run=dbg2" >/dev/null ) &
+has "$(curl -s -b $J "$BASE/api/run/debug/events?run=dbg2")" '"reason":"step"' "the editor is told where the program stopped"
+# Let that program go, so nothing is left waiting on a command that never comes.
+curl -s -b $J -X POST -H 'Content-Type: application/json' \
+    -d '{"cmd":"stop"}' "$BASE/api/run/debug/command?run=dbg2" >/dev/null
+chk "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/run/debug/events?run=dbg2")" "401" "the debug relay needs a session"
 
 echo "== teacher: worker load report =="
 wl=$(curl -s -b $JT $BASE/api/admin/workers)
@@ -304,6 +371,8 @@ tl=$(curl -s -b $JT "$BASE/api/fs/list?path=/tmplpy")
 has "$tl" 'starter' "template has a starter/ students receive"
 has "$tl" 'tests' "template has private tests/"
 has "$tl" 'solution' "template has a worked answer to check the tests"
+has "$tl" 'assignment.yaml' "template writes its settings as yaml"
+has "$(curl -s -b $JT "$BASE/api/fs/read?path=/tmplpy/assignment.yaml")" 'no_paste' "the settings file carries the paste setting"
 # Submit before the assignment is published: the teacher's own folder describes
 # it, and the unfinished starter must not pass everything.
 res=$(tpost /api/submit '{"assignment":"tmplpy"}')

@@ -9,7 +9,6 @@ package main
 // run it, see green, and edit from there rather than debug a blank folder.
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -142,6 +141,9 @@ green before you change anything.
   code runs, so expected answers are safe here.
 - solution/ your own worked answer. It is not published and not graded; it is
   here so you can check the tests really pass.
+- assignment.yaml  the settings: title, how long a run may take, when it is
+  due, and whether students may paste into it. Edit it before you publish, or
+  change the due date and the paste setting later from Class Management.
 
 ## Try it
 
@@ -164,25 +166,21 @@ func templateFiles(lang string) ([]templateFile, string) {
 }
 
 // authoringManifest describes an assignment the teacher has written but not yet
-// created, so it can be graded before it exists. It reads the assignment.json a
+// created, so it can be graded before it exists. It reads the assignment.yaml a
 // template leaves behind, and falls back to what the tests are written in.
 func authoringManifest(folder string) *Manifest {
 	if !isDir(filepath.Join(folder, "starter")) || !isDir(filepath.Join(folder, "tests")) {
 		return nil
 	}
 	m := &Manifest{Language: "", Title: filepath.Base(folder), TimeoutSec: 15}
-	if data, err := os.ReadFile(filepath.Join(folder, "assignment.json")); err == nil {
-		var meta struct {
-			Title      string `json:"title"`
-			Language   string `json:"language"`
-			TimeoutSec int    `json:"timeout_sec"`
-			MemMB      int    `json:"mem_mb"`
+	if meta := readAssignmentMeta(folder); meta != nil {
+		m.Language, m.TimeoutSec, m.MemMB = meta.Language, meta.TimeoutSec, meta.MemMB
+		m.NoPaste = meta.NoPaste
+		if due, ok := parseDue(meta.Due); ok {
+			m.Due = due
 		}
-		if json.Unmarshal(data, &meta) == nil {
-			m.Language, m.TimeoutSec, m.MemMB = meta.Language, meta.TimeoutSec, meta.MemMB
-			if meta.Title != "" {
-				m.Title = meta.Title
-			}
+		if meta.Title != "" {
+			m.Title = meta.Title
 		}
 	}
 	if m.Language == "" {
@@ -253,12 +251,25 @@ func handleAdminAssignmentTemplate(w http.ResponseWriter, r *http.Request) {
 	readme := fmt.Sprintf(templateReadme, title, entry, entry)
 	_ = os.WriteFile(filepath.Join(base, "README.md"), []byte(readme), 0o644)
 
-	// A manifest here is a convenience for the zip-upload path; creating from a
-	// folder asks for the classes interactively and writes its own.
-	meta, _ := json.MarshalIndent(map[string]any{
-		"id": folder, "title": title, "language": lang, "timeout_sec": 15,
-	}, "", "  ")
-	_ = os.WriteFile(filepath.Join(base, "assignment.json"), meta, 0o644)
+	// The description file the teacher edits. Creating from a folder reads the
+	// settings back out of it, and zipping the folder carries them along.
+	meta := fmt.Sprintf(`# What this assignment is, and how it is run.
+id: %s
+title: %s
+language: %s
+
+# How long one grading run may take, in seconds.
+timeout_sec: 15
+
+# When it is due: "2026-09-14 23:59", or a plain date for the end of that day.
+# Leave it empty for no due date. A late submission is still graded and still
+# reaches you; it is marked late. Use Unpublish to actually close an assignment.
+due:
+
+# Set to true to stop students pasting code they did not write in this editor.
+no_paste: false
+`, folder, title, lang)
+	_ = os.WriteFile(filepath.Join(base, "assignment.yaml"), []byte(meta), 0o644)
 
 	writeJSON(w, 200, map[string]any{
 		"ok": true, "folder": folder, "language": lang, "entry": entry})

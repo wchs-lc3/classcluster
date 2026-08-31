@@ -61,11 +61,11 @@
       word-break: break-all;
     }
 
-    /* Trim the activity bar to what the classroom needs: keep Explorer, the
-       teacher's Class Management view, and settings; hide the rest. */
+    /* Trim the activity bar to what the classroom needs: keep Explorer, Run and
+       Debug (where Variables, Watch, and the Call Stack live while a program is
+       paused), the teacher's Class Management view, and settings. */
     .activitybar .action-item:has([aria-label^="Search"]),
     .activitybar .action-item:has([aria-label^="Source Control"]),
-    .activitybar .action-item:has([aria-label^="Run and Debug"]),
     .activitybar .action-item:has([aria-label^="Extensions"]),
     .activitybar .action-item:has([aria-label^="Accounts"]) { display: none !important; }
   </style>
@@ -173,6 +173,59 @@
     });
   }
 
+  // An assignment can refuse pasted code. The rule belongs to the page, since
+  // the workbench renders here and the extension host cannot see a paste event
+  // at all; the extension only says which rule is in force, as the student
+  // moves between files.
+  //
+  // Copying inside the editor stays allowed, so a student can still move their
+  // own code around. Copying out of a code editor puts a marker alongside the
+  // text ("vscode-editor-data", which the workbench writes for its own
+  // multi-cursor support); text from a browser tab, a chat window, or a phone
+  // has no such marker, and that is what gets refused. A student who opens the
+  // developer tools can add the marker themselves. This slows down a paste from
+  // outside; it is not a boundary.
+  function guardPaste() {
+    const MARK = 'vscode-editor-data';
+    let blocking = false;
+    const bc = new BroadcastChannel('lc3-run');
+    bc.onmessage = (ev) => {
+      const m = ev.data || {};
+      if (m.t === 'paste-policy') blocking = !!m.block;
+    };
+    // The extension may have decided the rule before this page was listening,
+    // so ask for it rather than wait for the student to change file.
+    bc.postMessage({ t: 'paste-policy-request' });
+
+    document.addEventListener('paste', (ev) => {
+      if (!blocking || !ev.clipboardData) return;
+      if (ev.clipboardData.getData(MARK)) return; // copied in the editor; allow
+      ev.preventDefault();
+      ev.stopPropagation();
+      notePasteBlocked();
+    }, true);
+    // Dragging text or a file into the editor is the same move by another road.
+    document.addEventListener('drop', (ev) => {
+      if (!blocking) return;
+      ev.preventDefault(); ev.stopPropagation(); notePasteBlocked();
+    }, true);
+    document.addEventListener('dragover', (ev) => { if (blocking) ev.preventDefault(); }, true);
+  }
+
+  // Say why nothing happened, once, without stacking up notices.
+  let pasteNote = null;
+  function notePasteBlocked() {
+    if (pasteNote) return;
+    pasteNote = document.createElement('div');
+    pasteNote.textContent = 'Pasting is off for this assignment. Type it out.';
+    pasteNote.style.cssText =
+      'position:fixed;left:50%;transform:translateX(-50%);bottom:48px;z-index:60;' +
+      'padding:8px 14px;border-radius:4px;background:#3c2a00;color:#ffcc66;' +
+      'border:1px solid #6b4b00;font:13px -apple-system,Segoe UI,Ubuntu,sans-serif;';
+    document.body.appendChild(pasteNote);
+    setTimeout(() => { pasteNote.remove(); pasteNote = null; }, 2600);
+  }
+
   // The one hidden runtime iframe. It loads only the class's language engine and
   // executes the student's code, streaming output to the terminal.
   function mountRuntime(lang) {
@@ -269,6 +322,7 @@
       const lang = me.lang || (me.role === 'teacher' ? 'python' : '');
       if (lang) mountRuntime(lang);
     }
+    guardPaste();
   }
 
   (async function () {

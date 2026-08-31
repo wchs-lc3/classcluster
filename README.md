@@ -29,7 +29,14 @@ language's runtime: Pyodide in the browser for Python, a real JVM in the cluster
 for Java. A student sees only their class's assignments. The teacher creates classes and uploads assignments
 from the Class Management view inside the editor (an entry in the activity bar,
 teacher accounts only). One assignment can be published to several classes of
-the same language at once.
+the same language at once, and which classes it is for can be changed later:
+adding a class hands it to those students immediately, and removing one takes it
+back, keeping a copy of what they had done.
+
+Whoever joins a class gets whatever that class already has. That holds however
+they arrive: a student who signs up with the code, a student the teacher adds by
+hand, and a student moved into the class from another one all land on the
+class's published assignments with nothing to republish.
 
 Students make their own accounts. Each class has a join code; the teacher opens
 sign-ups, reads the code out, and the class creates accounts from the login page

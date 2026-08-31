@@ -240,6 +240,34 @@ has "$(curl -s -b /tmp/lc3-jsb $BASE/api/assignments)" 'hello-py' "second-class 
 printf '{"classes":["cp3","apcsa"],"zip_b64":"%s"}' "$B64" > /tmp/lc3-mx.json
 has "$(curl -s -b $JT -H 'Content-Type: application/json' --data @/tmp/lc3-mx.json $BASE/api/admin/assignments/upload)" 'same language' "mixed-language classes rejected"
 
+echo "== a student joining a class gets that class's published work =="
+tpost /api/admin/classes '{"id":"cls3","name":"Third","lang":"python"}' >/dev/null
+tpost /api/admin/students '{"username":"kid3","password":"kid3pw","class":"cls3"}' >/dev/null
+login /tmp/lc3-k3 kid3 kid3pw
+k3=$(curl -s -b /tmp/lc3-k3 "$BASE/api/fs/list?path=/")
+echo "$k3" | grep -q 'hello-py' && bad "a class with nothing published handed out an assignment" || ok "a new class starts with nothing published"
+# The same assignment, now also for the new class.
+res=$(tpost /api/admin/assignments/settings '{"id":"hello-py","classes":["cp3","secb","cls3"]}')
+has "$res" '"published_to":1' "adding a class publishes the assignment to its students"
+has "$(curl -s -b /tmp/lc3-k3 "$BASE/api/fs/list?path=/")" 'hello-py' "the student in the added class receives it"
+has "$(curl -s -b $J $BASE/api/assignments)" 'hello-py' "and the original class keeps it"
+# A student added after the fact gets it without anyone republishing.
+tpost /api/admin/students '{"username":"kid4","password":"kid4pw","class":"cls3"}' >/dev/null
+login /tmp/lc3-k4 kid4 kid4pw
+has "$(curl -s -b /tmp/lc3-k4 "$BASE/api/fs/list?path=/")" 'hello-py' "a student added to the class later gets it too"
+# Taking a class off the assignment takes the work back, but keeps a copy.
+curl -s -b /tmp/lc3-k3 -X POST --data-binary "def greet(name):
+    return 'kid3 was here'
+" "$BASE/api/fs/write?path=/hello-py/main.py" >/dev/null
+tpost /api/admin/assignments/settings '{"id":"hello-py","classes":["cp3","secb"]}' >/dev/null
+echo "$(curl -s -b /tmp/lc3-k3 "$BASE/api/fs/list?path=/")" | grep -q 'hello-py' && bad "dropping a class left the assignment in place" || ok "dropping a class takes the assignment back"
+has "$(curl -s -b $JT "$BASE/api/admin/collected/read?assignment=hello-py&user=kid3&path=main.py")" \
+    'kid3 was here' "their work is snapshotted before it is taken back"
+has "$(tpost /api/admin/assignments/settings '{"id":"hello-py","classes":["cp3","apcsa"]}')" \
+    'not a python class' "a class of the wrong language is refused"
+for u in kid3 kid4; do tpost /api/admin/students/delete "{\"username\":\"$u\"}" >/dev/null; done
+tpost /api/admin/classes/delete '{"id":"cls3"}' >/dev/null
+
 echo "== teacher: a zip of the folder itself uploads too =="
 # Zipping a folder rather than its contents is what a file manager does by
 # default, and it used to produce an assignment with no tests in it.

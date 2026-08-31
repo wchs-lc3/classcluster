@@ -1261,6 +1261,18 @@ register-admin = (context) ->
         latest.set s.username, s if s.assignment is id and not latest.has s.username
       review-next id, students, latest
 
+    # Which classes an assignment is for. Adding one hands it to that class now;
+    # dropping one takes it back, keeping a snapshot of what they had done.
+    vscode.commands.registerCommand 'lc3.assignmentClasses', guarded (item) ->
+      a = item?.lc3 or {}
+      return unless a.id
+      classes <- pick-classes 'Classes for "' + a.id + '" (space to select more)' .then
+      return unless classes
+      j <- post-json '/api/admin/assignments/settings', {id: a.id, classes: classes} .then
+      admin-tree.refresh!
+      vscode.window.showInformationMessage 'LC3: "' + a.id + '" is now for ' +
+        j.classes.join(', ') + ', published to ' + j.published_to + ' new students.'
+
     # When an assignment is due, and whether students may paste into it.
     vscode.commands.registerCommand 'lc3.assignmentSettings', guarded (item) ->
       a = item?.lc3 or {}

@@ -918,6 +918,9 @@ func handleAdminAddStudent(w http.ResponseWriter, r *http.Request) {
 	}
 	store.PutUser(body.Username, body.Password, body.Role, body.Class)
 	_ = os.MkdirAll(filepath.Join(studentsDir(), body.Username), 0o755)
+	// Whatever the class already has published belongs to them too, the same as
+	// for a student who joined with the code themselves.
+	reconcileStudent(body.Username)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -1653,10 +1656,13 @@ func handleAdminAssignmentSettings(w http.ResponseWriter, r *http.Request) {
 	if requireTeacher(w, r) == nil {
 		return
 	}
+	// Each field is optional: a caller changing the classes must not have to
+	// resend the due date, and vice versa.
 	var body struct {
-		ID      string `json:"id"`
-		Due     string `json:"due"`      // "2026-09-14 23:59", or "" for none
-		NoPaste bool   `json:"no_paste"` // block pasting from outside the editor
+		ID      string    `json:"id"`
+		Due     *string   `json:"due"`      // "2026-09-14 23:59", or "" for none
+		NoPaste *bool     `json:"no_paste"` // block pasting from outside the editor
+		Classes *[]string `json:"classes"`  // which classes get this assignment
 	}
 	if err := readBody(r, &body); err != nil {
 		fail(w, 400, "bad json")
@@ -1672,18 +1678,74 @@ func handleAdminAssignmentSettings(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "unknown assignment")
 		return
 	}
-	due, ok := parseDue(body.Due)
-	if !ok {
-		fail(w, 400, "due date must look like 2026-09-14 23:59, or be empty")
-		return
+	if body.Due != nil {
+		due, ok := parseDue(*body.Due)
+		if !ok {
+			fail(w, 400, "due date must look like 2026-09-14 23:59, or be empty")
+			return
+		}
+		m.Due = due
 	}
-	m.Due = due
-	m.NoPaste = body.NoPaste
+	if body.NoPaste != nil {
+		m.NoPaste = *body.NoPaste
+	}
+	dropped := []string{}
+	if body.Classes != nil {
+		classes := *body.Classes
+		if len(classes) == 0 {
+			fail(w, 400, "pick at least one class")
+			return
+		}
+		// An assignment is written in one language, so every class it reaches
+		// has to be taught in that language.
+		for _, c := range classes {
+			cl := store.ClassLang(c)
+			if cl == "" {
+				fail(w, 400, "unknown class: "+c)
+				return
+			}
+			if cl != m.Language {
+				fail(w, 400, "\""+c+"\" is not a "+m.Language+" class")
+				return
+			}
+		}
+		for _, was := range m.Classes {
+			if !contains(classes, was) {
+				dropped = append(dropped, was)
+			}
+		}
+		m.Classes = classes
+	}
 	if err := saveManifest(id, m); err != nil {
 		fail(w, 500, "could not save the assignment")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "due": m.Due, "no_paste": m.NoPaste})
+	// A class added here receives the assignment now; a class removed loses it,
+	// and its students' work is snapshotted on the way out.
+	published := 0
+	if body.Classes != nil {
+		// An unpublished assignment stays unpublished: changing who it is for is
+		// not the same as deciding it is open again.
+		if !m.Closed {
+			published, _ = publishAssignment(id)
+		}
+		for _, c := range dropped {
+			for _, s := range store.StudentsInClass(c) {
+				reconcileStudent(s)
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "due": m.Due, "no_paste": m.NoPaste,
+		"classes": m.Classes, "published_to": published})
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- admin: workers ----------

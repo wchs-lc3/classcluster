@@ -158,8 +158,14 @@ knows. Leave it unset if you do not want it.
   SQLite database.
 - `worker/` grading runner and sandbox; runs on workers and on the gateway.
 - `ext/lc3/` the VS Code web extension: server-backed files, Run in the
-  terminal, Submit, diagnostics, and the teacher's native Class Management view.
+  terminal, Submit, the Python debugger, diagnostics, and the teacher's native
+  Class Management view.
 - `web/` the single-page shell (`index.html`) and the hidden runtime host.
+
+The extension and the Python worker are written in LiveScript and compiled in
+the browser as they load, so there is still no build step: edit the `.ls` file,
+reload the page. The `.js` beside each one is the few lines that fetch the
+compiler and run the result.
 - `deploy/` nginx config, systemd units, installer, sync script.
 - `balena/` the same worker as a balenaOS fleet: `docker-compose.yml` in the
   repo root, one image for grading and one for the asset mirror, every setting

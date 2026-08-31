@@ -1,17 +1,16 @@
 # Language statistics only. Nothing here changes how anything builds or runs.
 #
-# GitHub counts exactly three hand-written JavaScript files in this repository:
-# the editor extension, the browser test, and the Pyodide worker. Together they
-# come to 119,385 bytes against the gateway's 117,370 bytes of Go, so the bar at
-# the top of the page reads "JavaScript" by a margin of about two kilobytes.
-# That is a fair count and an unfair impression, so they are not counted.
-ext/lc3/extension.js            linguist-detectable=false
-tests/browser_test.mjs          linguist-detectable=false
-web/runtime/pyodide-worker.js   linguist-detectable=false
+# The editor extension and the Python worker are LiveScript now, compiled in the
+# browser, so the JavaScript left in this repository is two small boot shims and
+# the browser test. Nothing is hidden from the count any more: what remains
+# marked below is genuinely vendored or genuinely generated.
+
+# The LiveScript compiler, bundled from the npm package and committed so a
+# classroom with no internet can still compile the editor extension.
+web/runtime/livescript.js       linguist-vendored=true
 
 # Bundles, built from npm packages and committed so a classroom with no internet
-# still gets a Java syntax checker and a formatter. Linguist works this out on
-# its own; saying it plainly costs nothing.
+# still gets a Java syntax checker and a formatter.
 web/runtime/java-format.js      linguist-generated=true
 web/runtime/java-parser.js      linguist-generated=true
 

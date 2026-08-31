@@ -1,0 +1,22 @@
+# Language statistics only. Nothing here changes how anything builds or runs.
+#
+# GitHub counts exactly three hand-written JavaScript files in this repository:
+# the editor extension, the browser test, and the Pyodide worker. Together they
+# come to 119,385 bytes against the gateway's 117,370 bytes of Go, so the bar at
+# the top of the page reads "JavaScript" by a margin of about two kilobytes.
+# That is a fair count and an unfair impression, so they are not counted.
+ext/lc3/extension.js            linguist-detectable=false
+tests/browser_test.mjs          linguist-detectable=false
+web/runtime/pyodide-worker.js   linguist-detectable=false
+
+# Bundles, built from npm packages and committed so a classroom with no internet
+# still gets a Java syntax checker and a formatter. Linguist works this out on
+# its own; saying it plainly costs nothing.
+web/runtime/java-format.js      linguist-generated=true
+web/runtime/java-parser.js      linguist-generated=true
+
+# The trimmed VS Code workbench: 39 MB of someone else's JavaScript.
+vendor/**                       linguist-vendored=true
+
+# Keep the sample assignments byte-for-byte; they are zips, not text to merge.
+examples/*.zip                  binary

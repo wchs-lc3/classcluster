@@ -407,6 +407,9 @@ type Manifest struct {
 	// NoPaste stops students pasting anything into this assignment's files that
 	// was not copied inside the editor.
 	NoPaste bool `json:"no_paste"`
+	// Entry is the file the input/output cases run ("main.py", "Cart.java").
+	// Empty lets the grader guess: main.py, or the one program file there is.
+	Entry string `json:"entry,omitempty"`
 }
 
 func collectedDir() string { return filepath.Join(dataDir, "collected") }
@@ -568,7 +571,10 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 	if u == nil {
 		return
 	}
-	var body struct{ Assignment string }
+	// Part is the teacher's choice of what to grade: "solution" runs their
+	// worked answer against the tests, anything else the starter. Students
+	// have one folder and no choice.
+	var body struct{ Assignment, Part string }
 	if err := readBody(r, &body); err != nil {
 		fail(w, 400, "bad json")
 		return
@@ -594,13 +600,20 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	workFolder := filepath.Join(studentRoot(u), aid)
 	testsFolder := filepath.Join(assignDir(), aid, "tests")
+	graded := "your code"
 	if dryRun {
 		// A teacher owns the authoring layout (<id>/starter + <id>/tests), not a
 		// student's flat copy, so Submit grades exactly the pair a student would
 		// be graded on: the starter they receive, against the tests that run.
 		// Their working copies win over the published ones, which is what makes
-		// Submit a usable check before publishing an edit.
-		if isDir(filepath.Join(own, "starter")) {
+		// Submit a usable check before publishing an edit. Asked for the
+		// solution, it grades solution/ instead, which is how the teacher checks
+		// that the tests can be passed at all.
+		graded = "starter"
+		if body.Part == "solution" && isDir(filepath.Join(own, "solution")) {
+			workFolder = filepath.Join(own, "solution")
+			graded = "solution"
+		} else if isDir(filepath.Join(own, "starter")) {
 			workFolder = filepath.Join(own, "starter")
 		} else if !isDir(own) {
 			workFolder = filepath.Join(assignDir(), aid, "starter")
@@ -624,6 +637,7 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 		"tests":       collectFiles(testsFolder, 512<<10, 8<<20),
 		"timeout_sec": m.TimeoutSec,
 		"mem_mb":      m.MemMB,
+		"entry":       m.Entry,
 	}
 
 	var result gradeResult
@@ -668,7 +682,7 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"id": id, "status": result.Status, "passed": passed,
 		"failed": len(tests) - passed, "tests": tests, "dry_run": dryRun,
-		"due": m.Due, "late": late && !dryRun})
+		"graded": graded, "due": m.Due, "late": late && !dryRun})
 }
 
 func handleCompileJava(w http.ResponseWriter, r *http.Request) {
@@ -1131,6 +1145,7 @@ func handleAdminUploadAssignment(w http.ResponseWriter, r *http.Request) {
 	timeout := body.TimeoutSec
 	var due int64
 	noPaste := false
+	entry := ""
 	starter := map[string][]byte{}
 	tests := map[string][]byte{}
 	prefix := zipWrapper(zr)
@@ -1166,6 +1181,7 @@ func handleAdminUploadAssignment(w http.ResponseWriter, r *http.Request) {
 				due = d
 			}
 			noPaste = meta.NoPaste
+			entry = meta.Entry
 		case strings.HasPrefix(name, "starter/"):
 			starter[strings.TrimPrefix(name, "starter/")] = data
 		case strings.HasPrefix(name, "tests/"):
@@ -1191,12 +1207,13 @@ func handleAdminUploadAssignment(w http.ResponseWriter, r *http.Request) {
 		title = id
 	}
 
+	m := &Manifest{Language: lang, Title: title, Classes: classes,
+		TimeoutSec: timeout, Due: due, NoPaste: noPaste, Entry: entry}
+	existed := keepPublishState(id, m)
 	base := filepath.Join(assignDir(), id)
 	_ = os.RemoveAll(base)
 	_ = os.MkdirAll(filepath.Join(base, "starter"), 0o755)
 	_ = os.MkdirAll(filepath.Join(base, "tests"), 0o755)
-	_ = saveManifest(id, &Manifest{Language: lang, Title: title, Classes: classes,
-		TimeoutSec: timeout, Due: due, NoPaste: noPaste})
 	writeSection := func(section string, files map[string][]byte) {
 		for rel, data := range files {
 			p, err := safePath(filepath.Join(base, section), rel)
@@ -1209,9 +1226,7 @@ func handleAdminUploadAssignment(w http.ResponseWriter, r *http.Request) {
 	}
 	writeSection("starter", starter)
 	writeSection("tests", tests)
-
-	n, _ := publishAssignment(id)
-	writeJSON(w, 200, map[string]any{"ok": true, "id": id, "published_to": n})
+	writeAssignment(w, id, m, existed)
 }
 
 // zipWrapper returns the single top-level directory every entry in a zip sits
@@ -1290,15 +1305,73 @@ func publishAssignment(id string) (int, error) {
 	count := 0
 	for _, s := range students {
 		dest := filepath.Join(studentsDir(), s, id)
-		if _, err := os.Stat(dest); err == nil {
-			continue
-		}
-		if copyTree(starter, dest) == nil {
+		if n, _ := copyMissing(starter, dest); n > 0 {
 			count++
 		}
 	}
 	_ = setAssignmentClosed(id, false) // publishing (re)opens the assignment
 	return count, nil
+}
+
+// copyMissing gives dst every file under src that it does not already have,
+// and returns how many it wrote. A student's own copy of a file is never
+// touched: publishing an assignment a second time, after the teacher fixed a
+// starter file or added one, hands over only what the student is missing.
+func copyMissing(src, dst string) (int, error) {
+	n := 0
+	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, path)
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if _, err := os.Stat(target); err == nil {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, data, 0o644); err != nil {
+			return err
+		}
+		n++
+		return nil
+	})
+	return n, err
+}
+
+// keepPublishState decides whether an assignment being written is open. One
+// that already exists keeps what it had: a teacher re-running Create from
+// Folder to fix the tests must not publish a closed assignment, nor close an
+// open one. A new assignment starts closed, so the teacher decides when the
+// class sees it. Returns whether the assignment existed before.
+func keepPublishState(id string, m *Manifest) bool {
+	if old := loadManifest(id); old != nil {
+		m.Closed = old.Closed
+		return true
+	}
+	m.Closed = true
+	return false
+}
+
+// writeAssignment saves a manifest and, if the assignment is open, hands the
+// starter to its students. It answers with what the teacher's view needs to
+// say: whether this was an update, whether it is published, and to how many.
+func writeAssignment(w http.ResponseWriter, id string, m *Manifest, existed bool) {
+	if err := saveManifest(id, m); err != nil {
+		fail(w, 500, "could not save the assignment")
+		return
+	}
+	n := 0
+	if !m.Closed {
+		n, _ = publishAssignment(id)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "id": id, "published_to": n,
+		"updated": existed, "closed": m.Closed})
 }
 
 // reconcileStudent makes a student's home hold exactly the assignment folders
@@ -1527,6 +1600,79 @@ func handleAdminCollectedRead(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+// handleAdminCollectedCheckout copies one student's recalled work into the
+// teacher's own files, under review/<assignment>/<student>, so the teacher can
+// Run it, type input into it, and edit it to try a case the tests did not. The
+// snapshot itself stays as it was; the copy is the teacher's to change.
+func handleAdminCollectedCheckout(w http.ResponseWriter, r *http.Request) {
+	u := requireTeacher(w, r)
+	if u == nil {
+		return
+	}
+	var body struct{ Assignment, User string }
+	if err := readBody(r, &body); err != nil {
+		fail(w, 400, "bad json")
+		return
+	}
+	if !validID(body.Assignment) || !validID(body.User) {
+		fail(w, 400, "bad id")
+		return
+	}
+	src := filepath.Join(collectedDir(), body.Assignment, body.User)
+	if !isDir(src) {
+		fail(w, 404, "nothing collected for that student")
+		return
+	}
+	rel := filepath.Join("review", body.Assignment, body.User)
+	dst := filepath.Join(studentRoot(u), rel)
+	_ = os.RemoveAll(dst)
+	if err := copyTree(src, dst); err != nil {
+		fail(w, 500, "could not copy the work")
+		return
+	}
+	entry := ""
+	if m := loadManifest(body.Assignment); m != nil {
+		entry = m.Entry
+	}
+	if entry == "" || !isFile(filepath.Join(dst, entry)) {
+		entry = guessEntry(dst)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true,
+		"folder": "/" + filepath.ToSlash(rel), "entry": entry})
+}
+
+func isFile(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// guessEntry picks the file to open first in a folder of student work: main.py
+// if there is one, else the Java file with a main method, else the first
+// program file. Empty when there is nothing to run.
+func guessEntry(dir string) string {
+	if isFile(filepath.Join(dir, "main.py")) {
+		return "main.py"
+	}
+	entries, _ := os.ReadDir(dir)
+	first := ""
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !(strings.HasSuffix(name, ".py") || strings.HasSuffix(name, ".java")) {
+			continue
+		}
+		if first == "" {
+			first = name
+		}
+		if strings.HasSuffix(name, ".java") {
+			if data, err := os.ReadFile(filepath.Join(dir, name)); err == nil &&
+				strings.Contains(string(data), "static void main") {
+				return name
+			}
+		}
+	}
+	return first
+}
+
 // handleAdminDeleteAssignment removes an assignment entirely: its definition
 // and tests, the recalled snapshots, and each student's copy.
 func handleAdminDeleteAssignment(w http.ResponseWriter, r *http.Request) {
@@ -1634,19 +1780,19 @@ func handleAdminAssignmentFromFolder(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "due in assignment.yaml must look like 2026-09-14 23:59")
 		return
 	}
+	m := &Manifest{Language: lang, Title: title, Classes: body.Classes,
+		TimeoutSec: timeout, MemMB: meta.MemMB, Due: due, NoPaste: meta.NoPaste,
+		Entry: meta.Entry}
+	existed := keepPublishState(id, m)
 	base := filepath.Join(assignDir(), id)
 	_ = os.RemoveAll(base)
 	_ = os.MkdirAll(filepath.Join(base, "starter"), 0o755)
 	_ = os.MkdirAll(filepath.Join(base, "tests"), 0o755)
-	_ = saveManifest(id, &Manifest{Language: lang, Title: title, Classes: body.Classes,
-		TimeoutSec: timeout, MemMB: meta.MemMB, Due: due, NoPaste: meta.NoPaste})
 	if st, err := os.Stat(starterSrc); err == nil && st.IsDir() {
 		_ = copyTree(starterSrc, filepath.Join(base, "starter"))
 	}
 	_ = copyTree(testsSrc, filepath.Join(base, "tests"))
-
-	n, _ := publishAssignment(id)
-	writeJSON(w, 200, map[string]any{"ok": true, "id": id, "published_to": n})
+	writeAssignment(w, id, m, existed)
 }
 
 // handleAdminAssignmentSettings changes the two things about a published
@@ -2047,6 +2193,7 @@ func main() {
 	mux.HandleFunc("POST /api/admin/assignments/settings", handleAdminAssignmentSettings)
 	mux.HandleFunc("GET /api/admin/collected", handleAdminCollected)
 	mux.HandleFunc("GET /api/admin/collected/read", handleAdminCollectedRead)
+	mux.HandleFunc("POST /api/admin/collected/checkout", handleAdminCollectedCheckout)
 	mux.HandleFunc("GET /api/admin/submissions", handleAdminSubmissions)
 	mux.HandleFunc("GET /api/admin/workers", handleAdminWorkers)
 	mux.HandleFunc("POST /api/admin/workers", handleAdminAddWorker)

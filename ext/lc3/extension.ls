@@ -473,7 +473,10 @@ run-command = ->
     {ui, pty} = get-terminal!
     ui.show!            # focus the terminal so the student can type input into it
     stop-active-run!    # end any run already in progress
-    pty.raw '\r\n\x1b[1m$ run ' + (path.split '/' .pop!) + '\x1b[0m\r\n'
+    # Each run starts on a clean screen (and a clean scrollback), so what is
+    # showing is this run's output and not the tail of the last one.
+    pty.raw '\x1b[2J\x1b[3J\x1b[H'
+    pty.raw '\x1b[1m$ run ' + (path.split '/' .pop!) + '\x1b[0m\r\n'
     if lang is 'java'
       run-java-cluster path, pty
     else
@@ -490,7 +493,7 @@ show-submit-result = (assignment, r) ->
   {ui, pty} = get-terminal!
   ui.show true
   pty.raw '\r\n\x1b[1m$ submit ' + assignment + '\x1b[0m\r\n'
-  pty.dim 'grading the starter against the tests, as a student would; not recorded' if r.dry_run
+  pty.dim 'grading the ' + r.graded + ' against the tests, as a student would; not recorded' if r.dry_run
   for t in r.tests
     pty.raw (if t.passed then '\x1b[32m  PASS  \x1b[0m' else '\x1b[31m  FAIL  \x1b[0m') + t.name + '\r\n'
   pty.dim 'result: ' + r.passed + ' passed, ' + r.failed + ' failed  (status: ' + r.status + ')'
@@ -500,7 +503,7 @@ show-submit-result = (assignment, r) ->
     pty.raw '\x1b[33m  submitted after the due date (' + due-text(r.due) + ')\x1b[0m\r\n'
     vscode.window.showWarningMessage assignment + ': submitted after the due date (' +
       due-text(r.due) + '). Your teacher can see that it was late.'
-  whose = if r.dry_run then 'the starter' else 'your code'
+  whose = if r.dry_run then 'the ' + r.graded else 'your code'
   if r.status is 'compile_error'
     vscode.window.showErrorMessage assignment + ': ' + whose + ' does not compile. Use Run to see details.'
   else if r.status is 'timeout'
@@ -509,6 +512,12 @@ show-submit-result = (assignment, r) ->
     vscode.window.showInformationMessage assignment + ': all ' + r.passed + ' tests passed!'
   else
     vscode.window.showWarningMessage assignment + ': ' + r.passed + ' passed, ' + r.failed + ' failed.'
+
+# A teacher grades whichever half of the assignment they are looking at: a file
+# under solution/ grades the worked answer, anything else the starter.
+part-of = (path) ->
+  parts = path.split '/' .filter (-> it)
+  if me.role is 'teacher' and parts[1] is 'solution' then 'solution' else 'starter'
 
 submit-command = ->
   path = active-lc3-file!
@@ -519,12 +528,13 @@ submit-command = ->
   if not assignment
     vscode.window.showWarningMessage 'Put your work in an assignment folder before submitting.'
     return
+  part = part-of path
   vscode.workspace.saveAll false
     .then ->
       if me.role is 'teacher'
         vscode.window.showInformationMessage 'Run "' + assignment +
           '" through grading the way a student would? ' +
-          'The starter is graded against the tests, and nothing is recorded.',
+          'The ' + part + ' is graded against the tests, and nothing is recorded.',
           {modal: true}, 'Run tests'
       else
         vscode.window.showWarningMessage 'Submit "' + assignment + '" for grading?',
@@ -536,7 +546,7 @@ submit-command = ->
         ->
           # For a teacher this is the same grading path a student's submission
           # takes, over the starter they publish; it just is not recorded.
-          req 'POST', '/api/submit', {assignment: assignment}
+          req 'POST', '/api/submit', {assignment: assignment, part: part}
             .then ((resp) ->
               if not resp.ok
                 return resp.json!.then ((j) ->
@@ -1046,6 +1056,17 @@ submission-row = (s) ->
   it.iconPath = new vscode.ThemeIcon (if s.failed is 0 and s.passed > 0 then 'pass' else 'warning')
   it
 
+# What creating an assignment did. A new one is unpublished until the teacher
+# says otherwise; one that already existed has had its tests and starter
+# replaced, and its students keep the work they had.
+created-text = (j) ->
+  if j.updated
+    'LC3: updated "' + j.id + '": the new tests are in effect and students keep their work' +
+      (if j.closed then '. It is still unpublished.' else '; ' + j.published_to +
+        ' students received files they were missing.')
+  else
+    'LC3: created "' + j.id + '" (unpublished). Press Publish when the class should see it.'
+
 pick-class = (place-holder, include-none) ->
   get-json '/api/admin/classes' .then (j) ->
     items = [{label: c.id, description: c.name + ' (' + c.lang + ')'} for c in (j.classes or [])]
@@ -1196,8 +1217,7 @@ register-admin = (context) ->
       return if id is undefined
       j <- post-json '/api/admin/assignments/from-folder', {folder: folder, id: id.trim!, classes: classes} .then
       admin-tree.refresh!
-      vscode.window.showInformationMessage 'LC3: created "' + j.id + '" and published to ' +
-        j.published_to + ' students.'
+      vscode.window.showInformationMessage created-text j
 
     vscode.commands.registerCommand 'lc3.deleteAssignment', guarded (item) ->
       id = item?.lc3?.id
@@ -1220,8 +1240,7 @@ register-admin = (context) ->
       return if id is undefined
       j <- post-json '/api/admin/assignments/upload',
         {classes: classes, id: id.trim!, zip_b64: bytes-to-b64 bytes} .then
-      vscode.window.showInformationMessage 'LC3: uploaded "' + j.id + '" to ' + classes.join(', ') +
-        ' and published to ' + j.published_to + ' students.'
+      vscode.window.showInformationMessage created-text j
       admin-tree.refresh!
 
     vscode.commands.registerCommand 'lc3.publishAssignment', guarded (item) ->
@@ -1359,6 +1378,22 @@ register-admin = (context) ->
 
 # One student's work, opened read-only, then back to the picker until the
 # teacher presses Escape.
+# Picking a student opens their files read-only. The play button on a row
+# instead copies that student's work into the teacher's own files, under
+# review/, and opens it there: a real folder, so Run, input, the debugger and
+# editing all work on it, for trying the case the tests did not cover.
+run-button = {iconPath: new vscode.ThemeIcon('play'), tooltip: 'Copy into my files and open it to run'}
+
+checkout-work = (id, username) ->
+  j <- post-json '/api/admin/collected/checkout', {assignment: id, user: username} .then
+  <- vscode.commands.executeCommand 'workbench.files.action.refreshFilesExplorer' .then
+  return unless j.entry
+  uri = vscode.Uri.from {scheme: 'lc3', path: j.folder + '/' + j.entry}
+  <- (vscode.workspace.openTextDocument uri
+    .then ((doc) -> vscode.window.showTextDocument doc, {preview: false}), (-> void)) .then
+  vscode.window.showInformationMessage 'LC3: ' + username + '\'s work is in your files at ' +
+    j.folder + '. Press Run to execute it; it is your copy to change.'
+
 review-next = (id, students, latest) ->
   items = for s in students
     sub = latest.get s.username
@@ -1367,19 +1402,30 @@ review-next = (id, students, latest) ->
       label: s.username
       description: tests + (if sub and sub.late then '  ·  late' else '') +
         '  ·  ' + (if s.files.length then s.files.length + ' files' else 'no work')
+      buttons: if s.files.length then [run-button] else []
       s: s
     }
-  vscode.window.showQuickPick items, {placeHolder: 'Read "' + id + '" - pick a student (Esc when done)'}
-    .then (pick) ->
-      return unless pick
-      opened = Promise.resolve!
-      for f in pick.s.files.slice 0, 8
-        let f = f
-          uri = vscode.Uri.parse 'lc3grade:/' + id + '/' + pick.s.username + '/' + f
-          opened := opened
-            .then -> vscode.workspace.openTextDocument uri
-            .then (doc) -> vscode.window.showTextDocument doc, {preview: false, preserveFocus: true}
-      opened.then -> review-next id, students, latest
+  qp = vscode.window.createQuickPick!
+  qp.items = items
+  qp.placeholder = 'Read "' + id + '" - pick a student to read, or press the play button to run their work (Esc when done)'
+  qp.onDidTriggerItemButton (ev) ->
+    qp.hide!
+    checkout-work id, ev.item.s.username
+  qp.onDidAccept ->
+    pick = qp.selectedItems[0]
+    qp.hide!
+    return unless pick
+    opened = Promise.resolve!
+    for f in pick.s.files.slice 0, 8
+      let f = f
+        uri = vscode.Uri.parse 'lc3grade:/' + id + '/' + pick.s.username + '/' + f
+        opened := opened
+          .then -> vscode.workspace.openTextDocument uri
+          .then (doc) -> vscode.window.showTextDocument doc, {preview: false, preserveFocus: true}
+    opened.then -> review-next id, students, latest
+  qp.onDidHide ->
+    qp.dispose!
+  qp.show!
 
 # --------------------------------- activate ---------------------------------
 

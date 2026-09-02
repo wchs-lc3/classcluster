@@ -91,6 +91,9 @@ async function bootstrap() {
   const zip = (rel) => readFileSync(new URL(rel, import.meta.url)).toString('base64');
   await post('/api/admin/assignments/upload', { class: 'cp3', zip_b64: zip('../examples/hello-py.zip') });
   await post('/api/admin/assignments/upload', { class: 'apcsa', zip_b64: zip('../examples/hello-java.zip') });
+  // An upload starts unpublished; the students below need to see these.
+  await post('/api/admin/assignments/publish', { id: 'hello-py' });
+  await post('/api/admin/assignments/publish', { id: 'hello-java' });
 }
 await bootstrap();
 
@@ -146,6 +149,27 @@ try {
     }, { timeout: 15000 });
     ok('activity bar trimmed (Explorer and Run and Debug; no SCM/Extensions/Search)');
   } catch (e) { bad('activity bar not trimmed: ' + e.message); }
+
+  // --- the page lets a touch screen pinch-zoom it ---
+  try {
+    const pinch = await page.evaluate(() => {
+      const meta = document.querySelector('meta[name=viewport]');
+      const wb = document.querySelector('.monaco-workbench.web');
+      // A touchpad pinch reaches the page as a ctrl+wheel; the workbench
+      // cancels those unless the page keeps them from it.
+      const ev = new WheelEvent('wheel', { deltaY: -100, ctrlKey: true, bubbles: true, cancelable: true });
+      (document.querySelector('.editor-group-container') || wb).dispatchEvent(ev);
+      return {
+        viewport: meta ? meta.getAttribute('content') : '',
+        touchAction: wb ? getComputedStyle(wb).touchAction : 'no workbench',
+        wheelCancelled: ev.defaultPrevented,
+      };
+    });
+    if (/user-scalable=no|maximum-scale/.test(pinch.viewport)) bad('viewport meta forbids zooming: ' + pinch.viewport);
+    else if (pinch.touchAction !== 'pinch-zoom') bad('workbench touch-action is ' + pinch.touchAction + ', so a pinch does nothing');
+    else if (pinch.wheelCancelled) bad('the workbench cancels ctrl+wheel, so a touchpad pinch does nothing');
+    else ok('pinch-zoom is left to the browser (touch-action pinch-zoom, ctrl+wheel not cancelled)');
+  } catch (e) { bad('pinch check: ' + e.message); }
 
   // --- hidden runtime iframe present, only the python engine ---
   const hasRuntime = page.frames().some(f => f.url().includes('/runtime/'));
@@ -298,7 +322,10 @@ try {
     await page.keyboard.type('STALE'); // typed while idle; must be discarded
     await new Promise(r => setTimeout(r, 300));
     await paletteRun(page, 'LC3: Run Program');
-    await page.waitForFunction(() => { const rows = [...document.querySelectorAll('.xterm-rows')].map(x => x.innerText).join(' '); return (rows.match(/Name\?/g) || []).length >= 2; }, { timeout: 60000 });
+    // Each Run clears the terminal, so the first run's answer is gone by the
+    // time the second run is asking its question.
+    await page.waitForFunction(() => { const rows = [...document.querySelectorAll('.xterm-rows')].map(x => x.innerText).join(' '); return /Name\?/.test(rows) && !/HI_Bob/.test(rows); }, { timeout: 60000 });
+    ok('a new Run starts on a cleared terminal');
     await page.keyboard.type('Zoe'); await page.keyboard.press('Enter');
     await page.waitForFunction(() => /HI_Zoe/.test([...document.querySelectorAll('.xterm-rows')].map(x => x.innerText).join(' ')), { timeout: 20000 });
     const t2 = await termText();

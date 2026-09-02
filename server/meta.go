@@ -32,6 +32,9 @@ type assignmentMeta struct {
 	// "2026-09-14" for the end of that day. Empty means no due date.
 	Due     string `yaml:"due"`
 	NoPaste bool   `yaml:"no_paste"`
+	// Entry is the program the input/output cases run. Empty means main.py, or
+	// the one program file the starter has.
+	Entry string `yaml:"entry"`
 }
 
 // metaNames are the file names looked for, in order. assignment.json is the

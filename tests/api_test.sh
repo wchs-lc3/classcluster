@@ -43,8 +43,13 @@ has "$(tpost /api/admin/classes '{"id":"cp3","name":"CP3 Python","lang":"python"
 has "$(tpost /api/admin/classes '{"id":"apcsa","name":"AP CS A","lang":"java"}')" '"ok":true' "create class apcsa (java)"
 has "$(tpost /api/admin/students '{"username":"demo","password":"demo","class":"cp3"}')" '"ok":true' "add student demo -> cp3"
 has "$(tpost /api/admin/students '{"username":"sj","password":"sj","class":"apcsa"}')" '"ok":true' "add student sj -> apcsa"
-has "$(upload_zip cp3 "$DIR/examples/hello-py.zip")" '"ok":true' "upload hello-py.zip to cp3"
+tpost /api/admin/assignments/delete '{"id":"hello-py"}' >/dev/null   # so a rerun still sees a fresh one
+up=$(upload_zip cp3 "$DIR/examples/hello-py.zip")
+has "$up" '"ok":true' "upload hello-py.zip to cp3"
+has "$up" '"closed":true' "a new assignment starts unpublished"
 has "$(upload_zip apcsa "$DIR/examples/hello-java.zip")" '"ok":true' "upload hello-java.zip to apcsa"
+tpost /api/admin/assignments/publish '{"id":"hello-py"}' >/dev/null
+tpost /api/admin/assignments/publish '{"id":"hello-java"}' >/dev/null
 
 echo "== auth =="
 code=$(curl -s -o /dev/null -w '%{http_code}' -c $J -H 'Content-Type: application/json' \
@@ -286,7 +291,7 @@ WB64=$(base64 -w0 /tmp/lc3-wrap/wrapped.zip)
 printf '{"classes":["cp3"],"zip_b64":"%s"}' "$WB64" > /tmp/lc3-wrapup.json
 has "$(curl -s -b $JT -H 'Content-Type: application/json' --data @/tmp/lc3-wrapup.json $BASE/api/admin/assignments/upload)" \
     '"id":"wrapped"' "a zip with one wrapping folder is unwrapped"
-has "$(curl -s -b $J $BASE/api/assignments)" 'wrapped' "the unwrapped assignment reaches the student"
+has "$(curl -s -b $JT $BASE/api/assignments)" 'wrapped' "the unwrapped assignment exists"
 tpost /api/admin/assignments/delete '{"id":"wrapped"}' >/dev/null
 
 echo "== teacher: reset password =="
@@ -312,10 +317,100 @@ curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/mkasg/tests" >/dev/null
 curl -s -b $JT -X POST --data-binary 'def add(a,b): return 0' "$BASE/api/fs/write?path=/mkasg/starter/main.py" >/dev/null
 curl -s -b $JT -X POST --data-binary 'import main
 def test_add(): assert main.add(2,3)==5' "$BASE/api/fs/write?path=/mkasg/tests/test_main.py" >/dev/null
-has "$(tpost /api/admin/assignments/from-folder '{"folder":"/mkasg","id":"mkasg","classes":["cp3"]}')" '"ok":true' "create assignment from an authored folder"
-has "$(curl -s -b $J $BASE/api/assignments)" 'mkasg' "authored assignment reaches the student"
+mk=$(tpost /api/admin/assignments/from-folder '{"folder":"/mkasg","id":"mkasg","classes":["cp3"]}')
+has "$mk" '"ok":true' "create assignment from an authored folder"
+has "$mk" '"updated":false' "and it is new"
+echo "$(curl -s -b $J $BASE/api/assignments)" | grep -q mkasg && bad "an unpublished assignment reached the student" || ok "a new assignment is hidden until published"
+tpost /api/admin/assignments/publish '{"id":"mkasg"}' >/dev/null
+has "$(curl -s -b $J $BASE/api/assignments)" 'mkasg' "authored assignment reaches the student once published"
+
+echo "== teacher: fixing the tests after the class has started =="
+curl -s -b $J -X POST --data-binary 'def add(a,b): return a+b   # my work' "$BASE/api/fs/write?path=/mkasg/main.py" >/dev/null
+curl -s -b $JT -X POST --data-binary 'import main
+def test_add(): assert main.add(2,3)==5
+def test_add_negative(): assert main.add(-1,1)==0' "$BASE/api/fs/write?path=/mkasg/tests/test_main.py" >/dev/null
+curl -s -b $JT -X POST --data-binary 'x = 1' "$BASE/api/fs/write?path=/mkasg/starter/extra.py" >/dev/null
+mk=$(tpost /api/admin/assignments/from-folder '{"folder":"/mkasg","id":"mkasg","classes":["cp3"]}')
+has "$mk" '"updated":true' "creating again from the folder is an update"
+has "$mk" '"closed":false' "an open assignment stays open through an update"
+has "$(curl -s -b $J "$BASE/api/fs/read?path=/mkasg/main.py")" 'my work' "the student keeps their work"
+chk "$(curl -s -b $J "$BASE/api/fs/read?path=/mkasg/extra.py")" "x = 1" "a starter file the student did not have is handed over"
+res=$(curl -s -b $J -X POST -H 'Content-Type: application/json' -d '{"assignment":"mkasg"}' $BASE/api/submit)
+has "$res" 'test_add_negative' "the new tests are the ones that run"
+tpost /api/admin/assignments/unpublish '{"id":"mkasg"}' >/dev/null
+mk=$(tpost /api/admin/assignments/from-folder '{"folder":"/mkasg","id":"mkasg","classes":["cp3"]}')
+has "$mk" '"closed":true' "a closed assignment stays closed through an update"
 tpost /api/admin/assignments/delete '{"id":"mkasg"}' >/dev/null
 echo "$(curl -s -b $J $BASE/api/assignments)" | grep -q mkasg && bad "deleted assignment still visible" || ok "delete assignment removes it"
+
+echo "== grading: input/output cases, and a script with no main guard =="
+curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/ioasg/starter" >/dev/null
+curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/ioasg/tests" >/dev/null
+curl -s -b $JT -X POST --data-binary 'name = input("Name? ")
+print("Hi " + name)' "$BASE/api/fs/write?path=/ioasg/starter/main.py" >/dev/null
+curl -s -b $JT -X POST --data-binary 'Ada' "$BASE/api/fs/write?path=/ioasg/tests/greets.in" >/dev/null
+curl -s -b $JT -X POST --data-binary 'Name? Hi Ada' "$BASE/api/fs/write?path=/ioasg/tests/greets.out" >/dev/null
+printf '\n' | curl -s -b $JT -X POST --data-binary @- "$BASE/api/fs/write?path=/ioasg/tests/empty_name.in" >/dev/null
+curl -s -b $JT -X POST --data-binary 'Name? Hi ' "$BASE/api/fs/write?path=/ioasg/tests/empty_name.out" >/dev/null
+curl -s -b $JT -X POST --data-binary 'x' "$BASE/api/fs/write?path=/ioasg/tests/no_input_needed.out" >/dev/null
+tpost /api/admin/assignments/from-folder '{"folder":"/ioasg","id":"ioasg","classes":["cp3"]}' >/dev/null
+tpost /api/admin/assignments/publish '{"id":"ioasg"}' >/dev/null
+res=$(curl -s -b $J -X POST -H 'Content-Type: application/json' -d '{"assignment":"ioasg"}' $BASE/api/submit)
+echo "  -> $res"
+has "$res" '"name":"io.greets","passed":true' "a script with input() and no functions passes its io case"
+has "$res" '"name":"io.empty_name","passed":true' "an input of one blank line reads as an empty answer"
+has "$res" '"name":"io.no_input_needed","passed":false' "a case with no .in gives the program nothing to read"
+curl -s -b $J -X POST --data-binary 'name = input("Name? ")
+print("Hello " + name)' "$BASE/api/fs/write?path=/ioasg/main.py" >/dev/null
+res=$(curl -s -b $J -X POST -H 'Content-Type: application/json' -d '{"assignment":"ioasg"}' $BASE/api/submit)
+has "$res" '"name":"io.greets","passed":false' "output that differs fails the case"
+echo "$res" | grep -q 'Hi Ada' && bad "grade output leaks the expected output" || ok "the expected output is not in the reply"
+# Top-level code beside functions: the unit tests still reach the functions.
+curl -s -b $JT -X POST --data-binary 'import main
+def test_double(): assert main.double(4) == 8' "$BASE/api/fs/write?path=/ioasg/tests/test_main.py" >/dev/null
+curl -s -b $JT -X POST --data-binary 'Name? Hi Ada
+8' "$BASE/api/fs/write?path=/ioasg/tests/greets.out" >/dev/null
+tpost /api/admin/assignments/from-folder '{"folder":"/ioasg","id":"ioasg","classes":["cp3"]}' >/dev/null
+curl -s -b $J -X POST --data-binary 'def double(n):
+    return n * 2
+name = input("Name? ")
+print("Hi " + name)
+print(double(4))
+exit()' "$BASE/api/fs/write?path=/ioasg/main.py" >/dev/null
+res=$(curl -s -b $J -X POST -H 'Content-Type: application/json' -d '{"assignment":"ioasg"}' $BASE/api/submit)
+echo "  -> $res"
+has "$res" '"name":"test_main.test_double","passed":true' "a unit test reaches a function in a file with top-level input() and exit()"
+has "$res" '"name":"io.greets","passed":true' "and the io case still runs the whole program"
+has "$res" '"status":"ok"' "with an ok status"
+tpost /api/admin/assignments/delete '{"id":"ioasg"}' >/dev/null
+curl -s -b $JT -X POST "$BASE/api/fs/delete?path=/ioasg" >/dev/null
+
+echo "== grading: java input/output case beside junit =="
+curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/iojava/starter" >/dev/null
+curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/iojava/tests" >/dev/null
+curl -s -b $JT -X POST --data-binary 'import java.util.Scanner;
+public class Greet {
+  public static String greet(String n) { return "Hi " + n; }
+  public static void main(String[] a) {
+    Scanner s = new Scanner(System.in);
+    System.out.print("Name? ");
+    System.out.println(greet(s.nextLine()));
+  }
+}' "$BASE/api/fs/write?path=/iojava/starter/Greet.java" >/dev/null
+curl -s -b $JT -X POST --data-binary 'Ada' "$BASE/api/fs/write?path=/iojava/tests/greets.in" >/dev/null
+curl -s -b $JT -X POST --data-binary 'Name? Hi Ada' "$BASE/api/fs/write?path=/iojava/tests/greets.out" >/dev/null
+curl -s -b $JT -X POST --data-binary 'import org.junit.Test;
+import static org.junit.Assert.assertEquals;
+public class GreetTest {
+  @Test public void greets() { assertEquals("Hi Bob", Greet.greet("Bob")); }
+}' "$BASE/api/fs/write?path=/iojava/tests/GreetTest.java" >/dev/null
+tpost /api/admin/assignments/from-folder '{"folder":"/iojava","id":"iojava","classes":["apcsa"]}' >/dev/null
+res=$(tpost /api/submit '{"assignment":"iojava"}')
+echo "  -> $res"
+has "$res" '"name":"io.greets","passed":true' "a java io case runs the class with main"
+has "$res" '"name":"GreetTest.greets","passed":true' "beside the junit test"
+tpost /api/admin/assignments/delete '{"id":"iojava"}' >/dev/null
+curl -s -b $JT -X POST "$BASE/api/fs/delete?path=/iojava" >/dev/null
 
 echo "== teacher: reading submissions (recall, read, unpublish) =="
 curl -s -b $J -X POST --data-binary "def greet(name):
@@ -324,6 +419,11 @@ curl -s -b $J -X POST --data-binary "def greet(name):
 has "$(tpost /api/admin/assignments/recall '{"id":"hello-py"}')" '"collected"' "recall snapshots student code"
 has "$(curl -s -b $JT "$BASE/api/admin/collected?assignment=hello-py")" '"username":"demo"' "collected lists the student"
 has "$(curl -s -b $JT "$BASE/api/admin/collected/read?assignment=hello-py&user=demo&path=main.py")" 'greet' "teacher reads the student's actual code"
+co=$(tpost /api/admin/collected/checkout '{"assignment":"hello-py","user":"demo"}')
+has "$co" '"folder":"/review/hello-py/demo"' "the teacher can take a copy of a student's work into their own files"
+has "$co" '"entry":"main.py"' "and is told which file to run"
+has "$(curl -s -b $JT "$BASE/api/fs/read?path=/review/hello-py/demo/main.py")" 'greet' "the copy is a real file in the teacher's files"
+chk "$(curl -s -o /dev/null -w '%{http_code}' -b $J -H 'Content-Type: application/json' -d '{"assignment":"hello-py","user":"demo"}' $BASE/api/admin/collected/checkout)" "403" "a student cannot take a copy"
 # Scores are not kept on this device: there is nowhere to put one.
 col=$(curl -s -b $JT "$BASE/api/admin/collected?assignment=hello-py")
 echo "$col" | grep -q '"score"' && bad "collected still carries a score field" || ok "no grade is stored with the collected work"
@@ -407,10 +507,11 @@ res=$(tpost /api/submit '{"assignment":"tmplpy"}')
 has "$res" '"dry_run":true' "a teacher's Submit is a rehearsal, not a grade"
 has "$res" '"tests"' "the unpublished template grades through the real path"
 echo "$res" | grep -q '"failed":0' && bad "the unfinished starter passed everything" || ok "the unfinished starter fails, as a student's would"
-# Now with the worked answer in place, everything passes.
-sol=$(curl -s -b $JT "$BASE/api/fs/read?path=/tmplpy/solution/main.py")
-curl -s -b $JT -X POST --data-binary "$sol" "$BASE/api/fs/write?path=/tmplpy/starter/main.py" >/dev/null
-has "$(tpost /api/submit '{"assignment":"tmplpy"}')" '"failed":0' "the template's worked answer passes its own tests"
+has "$res" 'io.prints_total' "the template carries an input/output case"
+# The worked answer is graded in place: nothing to copy over the starter.
+res=$(tpost /api/submit '{"assignment":"tmplpy","part":"solution"}')
+has "$res" '"graded":"solution"' "a teacher can grade the solution instead of the starter"
+has "$res" '"failed":0' "the template's worked answer passes its own tests"
 subs=$(curl -s -b $JT $BASE/api/admin/submissions)
 echo "$subs" | grep -q 'tmplpy' && bad "a teacher's rehearsal was recorded as a submission" || ok "a rehearsal leaves no submission behind"
 

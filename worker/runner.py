@@ -23,6 +23,7 @@ import hmac
 import json
 import os
 import pty
+import shlex
 import shutil
 import signal
 import struct
@@ -217,35 +218,55 @@ def run_sandboxed(job_dir, mem_mb, timeout_sec, inner, vmem_limit=False):
     return proc.returncode
 
 
-def grade_python(job_dir, timeout_sec, mem_mb):
-    # The harness runs as the sandbox entry point: it reads the private tests
-    # into memory and deletes their source before importing student code, so
-    # student code cannot open the test files to read expected answers.
-    shutil.copyfile(PYHARNESS, os.path.join(job_dir, ".lc3_harness.py"))
-    inner = PYTHON_BIN + " /work/.lc3_harness.py"
-    rc = run_sandboxed(job_dir, mem_mb, timeout_sec, inner, vmem_limit=True)
+def read_report(job_dir):
+    """The harness's JSON report, or None when it never wrote one."""
     report = os.path.join(job_dir, ".lc3-report.json")
-    if rc in (124, 137) and not os.path.isfile(report):
-        return {"status": "timeout", "tests": []}
     if not os.path.isfile(report):
-        return {"status": "error", "tests": []}
+        return None
     try:
         with open(report) as f:
             result = json.load(f)
     except (OSError, ValueError):
-        return {"status": "error", "tests": []}
-    tests = [{"name": t.get("name", "?"), "passed": bool(t.get("passed"))}
-             for t in result.get("tests", [])]
+        return None
+    result["tests"] = [{"name": t.get("name", "?"), "passed": bool(t.get("passed"))}
+                       for t in result.get("tests", [])]
+    return result
+
+
+def grade_python(job_dir, timeout_sec, mem_mb, entry):
+    # The harness runs as the sandbox entry point: it reads the private tests
+    # into memory and deletes their source before importing student code, so
+    # student code cannot open the test files to read expected answers.
+    shutil.copyfile(PYHARNESS, os.path.join(job_dir, ".lc3_harness.py"))
+    inner = ("LC3_TIMEOUT=" + str(timeout_sec) + " LC3_ENTRY=" + shlex.quote(entry or "") +
+             " " + PYTHON_BIN + " /work/.lc3_harness.py")
+    rc = run_sandboxed(job_dir, mem_mb, timeout_sec, inner, vmem_limit=True)
+    result = read_report(job_dir)
     if rc in (124, 137):
-        return {"status": "timeout", "tests": tests}
-    return {"status": result.get("status", "error"), "tests": tests}
+        return {"status": "timeout", "tests": result["tests"] if result else []}
+    if result is None:
+        return {"status": "error", "tests": []}
+    return {"status": result.get("status", "error"), "tests": result["tests"]}
 
 
-def grade_java(job_dir, timeout_sec, mem_mb):
+def grade_java(job_dir, timeout_sec, mem_mb, entry):
     jars = f"{JAVA_LIBS}/junit.jar:{JAVA_LIBS}/hamcrest.jar:{JAVA_LIBS}/lc3runner"
+    xmx = str(max(MEM_MIN_MB, min(MEM_MAX_MB, GRADE_JAVA_XMX_MB)))
+    # The input/output cases run the program whole, so they need the class
+    # with main; the test classes are not it.
+    main_class, _ = find_main_class(job_dir, entry, skip_tests=True)
+    shutil.copyfile(PYHARNESS, os.path.join(job_dir, ".lc3_harness.py"))
+    io_step = ""
+    if main_class:
+        io_step = (
+            "&& LC3_TIMEOUT=" + str(timeout_sec) + " " + PYTHON_BIN + " /work/.lc3_harness.py --io "
+            "java -Xmx" + xmx + "m -cp /work/.classes " + shlex.quote(main_class) + " "
+        )
     # Compile everything, then delete all .java source (student and tests)
     # before running: student code cannot read the test source at runtime.
-    # Only .class files remain, so the private tests are not lying around.
+    # Only .class files remain, so the private tests are not lying around. The
+    # cases go first, since the harness removes the expected output files as
+    # it reads them.
     inner = (
         "mkdir -p /work/.classes && "
         "javac --release 8 -Xlint:-options -encoding UTF-8 -cp '" + jars + "' -d /work/.classes "
@@ -253,7 +274,8 @@ def grade_java(job_dir, timeout_sec, mem_mb):
         ">/work/.lc3-compile.txt 2>&1 "
         "&& echo COMPILED > /work/.lc3-compiled "
         "&& find /work -maxdepth 3 -name '*.java' -delete "
-        "&& java -Xmx" + str(max(MEM_MIN_MB, min(MEM_MAX_MB, GRADE_JAVA_XMX_MB))) + "m "
+        + io_step +
+        "&& java -Xmx" + xmx + "m "
         "-cp '/work/.classes:" + jars + "' LC3Runner "
         "$(cd /work/.classes && ls *Test*.class 2>/dev/null | sed 's/\\.class$//' | grep -v '\\$') "
         ">/work/.lc3-results.txt 2>/work/.lc3-stderr.txt"
@@ -262,9 +284,10 @@ def grade_java(job_dir, timeout_sec, mem_mb):
     if not os.path.isfile(os.path.join(job_dir, ".lc3-compiled")):
         return {"status": "compile_error", "tests": []}
     results = os.path.join(job_dir, ".lc3-results.txt")
+    io_result = read_report(job_dir)
+    tests = io_result["tests"] if io_result else []
     if rc in (124, 137) and not os.path.isfile(results):
-        return {"status": "timeout", "tests": []}
-    tests = []
+        return {"status": "timeout", "tests": tests}
     try:
         with open(results, "r", errors="replace") as f:
             for line in f:
@@ -294,14 +317,17 @@ public class LC3Main {
 """
 
 
-def find_main_class(files_dir, entry):
+def find_main_class(files_dir, entry, skip_tests=False):
     """Best-effort: the class with a main method, preferring the entry file.
-    Returns (class_name, has_package)."""
+    Returns (class_name, has_package). skip_tests leaves out files named like
+    test classes, for grading, where the program is wanted and not the tests."""
     import re
     candidates = []
     for dirpath, _, filenames in os.walk(files_dir):
         for fn in filenames:
             if not fn.endswith(".java"):
+                continue
+            if skip_tests and "Test" in fn:
                 continue
             p = os.path.join(dirpath, fn)
             try:
@@ -378,9 +404,10 @@ def grade(payload):
     try:
         write_files(job_dir, payload.get("files", {}))
         write_files(job_dir, payload.get("tests", {}))
+        entry = os.path.basename(str(payload.get("entry", "") or ""))
         if language == "java":
-            return grade_java(job_dir, timeout_sec, mem_mb)
-        return grade_python(job_dir, timeout_sec, mem_mb)
+            return grade_java(job_dir, timeout_sec, mem_mb, entry)
+        return grade_python(job_dir, timeout_sec, mem_mb, entry)
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
 

@@ -52,6 +52,9 @@ if __name__ == '__main__':
 #
 # The rules: the file is named test_*.py, every test is a function named
 # test_*, and checks are plain assert. Import the student's module by name.
+# A student file with code at the top level (prints, input() calls, no main
+# guard) still imports: its top-level statements run with no input and their
+# output thrown away, and the functions come through.
 
 import main
 
@@ -67,6 +70,9 @@ def test_no_items_is_zero():
 def test_zero_tax_is_the_plain_sum():
     assert main.total_price([2.5, 2.5], 0.0) == 5.0
 `},
+	// An input/output case: the program is run whole and what it prints is
+	// compared with this file. A prints_total.in beside it would be the input.
+	{"tests/prints_total.out", "16.05\n"},
 }
 
 // The Java template. The grader compiles every .java it finds and runs each
@@ -125,6 +131,9 @@ public class CartTest {
     }
 }
 `},
+	// An input/output case: Cart.main is run and what it prints is compared
+	// with this file. A prints_total.in beside it would be the input.
+	{"tests/prints_total.out", "16.05\n"},
 }
 
 const templateReadme = `# %s
@@ -137,25 +146,36 @@ green before you change anything.
 - starter/  what each student receives when you publish. This is the only
   folder they see.
 - tests/    the private tests the grader runs. Students never receive these,
-  and the grader deletes the test source inside the sandbox before student
-  code runs, so expected answers are safe here.
-- solution/ your own worked answer. It is not published and not graded; it is
-  here so you can check the tests really pass.
+  and the grader deletes them inside the sandbox before student code runs, so
+  expected answers are safe here. Two kinds live side by side:
+    - unit tests (test_*.py with test_* functions, or a JUnit class whose
+      name contains Test) call the student's functions;
+    - input/output cases (<case>.out, with an optional <case>.in) run the
+      whole program with that input and compare everything it prints, line
+      for line, with the .out file. Prompts count as output. These need no
+      functions and no main guard.
+- solution/ your own worked answer. It is not published; Submit with one of
+  its files open to check that the tests can be passed.
 - assignment.yaml  the settings: title, how long a run may take, when it is
-  due, and whether students may paste into it. Edit it before you publish, or
-  change the due date and the paste setting later from Class Management.
+  due, whether students may paste into it, and which file the input/output
+  cases run. Edit it before you publish, or change the due date and the paste
+  setting later from Class Management.
 
 ## Try it
 
-1. Press Submit with a file from this folder open. Submit runs the starter
+1. Press Submit with a file from starter/ open. Submit runs the starter
    against the tests on a worker, exactly the way a student's submission runs.
    The starter is unfinished, so the tests fail: that is the expected result.
-2. Copy solution/%s over starter/%s and press Submit again. Everything passes.
-3. Copy the starter back, then write your own task.
+2. Open solution/%s and press Submit. Everything passes.
+3. Write your own task in starter/%s, the answer in solution/, and the tests.
 
 ## Publish it
 
 Class Management -> Assignments -> Create from folder, and give this folder.
+The assignment is created unpublished; press Publish when the class should
+see it. To change the tests later, edit tests/ and run Create from folder
+again: the new tests take effect at the next Submit, students keep the work
+they have, and any starter file they do not have yet is handed to them.
 `
 
 func templateFiles(lang string) ([]templateFile, string) {
@@ -176,6 +196,7 @@ func authoringManifest(folder string) *Manifest {
 	if meta := readAssignmentMeta(folder); meta != nil {
 		m.Language, m.TimeoutSec, m.MemMB = meta.Language, meta.TimeoutSec, meta.MemMB
 		m.NoPaste = meta.NoPaste
+		m.Entry = meta.Entry
 		if due, ok := parseDue(meta.Due); ok {
 			m.Due = due
 		}
@@ -268,7 +289,11 @@ due:
 
 # Set to true to stop students pasting code they did not write in this editor.
 no_paste: false
-`, folder, title, lang)
+
+# The file the input/output cases in tests/ run. Leave it empty for main.py,
+# or for the one program file the starter has.
+entry: %s
+`, folder, title, lang, entry)
 	_ = os.WriteFile(filepath.Join(base, "assignment.yaml"), []byte(meta), 0o644)
 
 	writeJSON(w, 200, map[string]any{

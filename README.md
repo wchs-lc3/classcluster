@@ -53,9 +53,10 @@ retires the old one immediately.
   to what a class needs: no Source Control, Run and Debug, Extensions, or Search.
 - Run in the terminal, with real input: pressing Run executes the open file and
   streams its output into the integrated terminal, waiting for keyboard input as
-  the program reads it. Python runs in the browser on Pyodide; Java compiles and
-  runs on a real JVM in the cluster (so `Scanner`/`System.in` actually block),
-  distributed to the workers with the gateway used last.
+  the program reads it. Each Run starts on a cleared terminal. Python runs in
+  the browser on Pyodide; Java compiles and runs on a real JVM in the cluster
+  (so `Scanner`/`System.in` actually block), distributed to the workers with the
+  gateway used last.
 - Errors in the editor: syntax errors show as red squiggles and in the Problems
   panel as you save (Python via Pyodide, Java via a bundled JS parser, both in
   the browser); runtime errors highlight the line and print the trace in the
@@ -63,9 +64,15 @@ retires the old one immediately.
   Java, both in the browser.
 - Submit is a self-check: it grades the code against the private tests and
   returns pass/fail per test, so a student can see whether their solution is
-  correct. Grading runs in a bwrap + systemd sandbox (no network, no filesystem
+  correct. Tests are of two kinds, and an assignment can mix them: unit tests
+  that call the student's functions (pytest-style `test_*.py`, or JUnit), and
+  input/output cases that run the whole program with a given input and compare
+  what it prints, line for line, with the expected output. A program written
+  as a script, with no functions and no main guard, is graded by the cases;
+  one that mixes top-level code and functions still imports for the unit
+  tests. Grading runs in a bwrap + systemd sandbox (no network, no filesystem
   beyond its job directory, memory and process caps, a hard timeout); the test
-  source is deleted before student code runs, so it cannot read the answers.
+  files are deleted before student code runs, so it cannot read the answers.
 - Debugging Python: breakpoints, step in, over and out, the call stack, and the
   values of variables while the program is stopped. It runs in the browser, on
   the student's own machine, so a class debugging at once costs the cluster
@@ -83,13 +90,21 @@ retires the old one immediately.
 - Reading the class's work: from the Class Management view the teacher recalls
   an assignment, which snapshots every student's code, and reads it read-only
   alongside how that student's last submission scored against the tests. The
-  grade itself goes in the school's gradebook; this device stores no scores and
-  no comments. Publish and unpublish open and close an assignment; unpublished
-  work stays readable.
+  play button on a student's row copies their work into the teacher's own
+  files instead, under `review/`, where Run, typed input, the debugger and
+  editing all work on it: the way to try the case the tests did not cover.
+  The grade itself goes in the school's gradebook; this device stores no scores
+  and no comments. Publish and unpublish open and close an assignment;
+  unpublished work stays readable.
 - Authoring on the device: the teacher can run both Python and Java, write an
   assignment's `starter/` and `tests/` in their own files, and turn that folder
-  into a published assignment without any external zip tool (or upload a zip).
-  What the assignment is, when it is due, and whether it takes pastes live in an
+  into an assignment without any external zip tool (or upload a zip). A new
+  assignment is unpublished until the teacher presses Publish. Creating it
+  again from the same folder, or uploading the same id again, replaces the
+  tests and the starter while students keep the work they have, so tests can
+  be fixed after the class has started; any starter file a student is missing
+  is handed to them. What the assignment is, when it is due, whether it takes
+  pastes, and which file the input/output cases run live in an
   `assignment.yaml` beside those folders, and the due date and the paste setting
   can also be changed later from the Class Management view. Assignments can be
   deleted, and student passwords reset, from the same view.
@@ -99,8 +114,10 @@ retires the old one immediately.
   against. Editing something that runs beats filling in an empty folder.
 - Rehearse before publishing: a teacher pressing Submit runs the starter against
   the tests through the same grading path a student's submission takes, on the
-  same workers, so what they see is what the class will see. A teacher's run is
-  not recorded as a submission.
+  same workers, so what they see is what the class will see. With a file from
+  `solution/` open, Submit grades the worked answer instead, which is how to
+  check that the tests can be passed. A teacher's run is not recorded as a
+  submission.
 - Cluster distribution: grading and interactive runs go to the Pi 3 workers
   first; the gateway's own runner is used last. Adding a Pi 3 from the admin
   view provisions it over SSH and expands the pool; a Pi flashed with the
@@ -134,6 +151,13 @@ knows. Leave it unset if you do not want it.
   match the AP CS A course. Python runs on the student's own machine.
 - Editor error checking: Python syntax is checked in the browser as you save;
   Java compile errors come from the cluster's `javac` when you Run.
+- An input/output case compares printed lines exactly, apart from trailing
+  spaces and trailing blank lines. Spelling, punctuation and spacing inside a
+  line all count, prompts included, so the expected output has to be written
+  the way the assignment asks for it.
+- On a touch screen the page zooms with a pinch; the browser's own zoom keys
+  and full-screen key (F11) apply as on any page. There is no zoom setting
+  inside the editor.
 - Submit returns test names and pass/fail only. Students see compile and runtime
   errors through Run, not Submit.
 - Debugging is Python only. There is no Java debugger; a Java program is run and

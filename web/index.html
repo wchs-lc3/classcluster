@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <title>LC3 Code</title>
   <meta name="mobile-web-app-capable" content="yes" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" href="/ide/favicon.ico" type="image/x-icon" />
   <link data-name="vs/workbench/workbench.web.main" rel="stylesheet" href="/ide/out/vs/workbench/workbench.web.main.css">
   <style>
@@ -68,6 +68,13 @@
     .activitybar .action-item:has([aria-label^="Source Control"]),
     .activitybar .action-item:has([aria-label^="Extensions"]),
     .activitybar .action-item:has([aria-label^="Accounts"]) { display: none !important; }
+
+    /* The workbench turns off every browser touch gesture so it can handle
+       scrolling and dragging itself. Pinch is handed back to the browser: a
+       two-finger spread zooms the page on a touch screen, while one-finger
+       scrolling and drags still reach the editor. (A touchpad pinch is a
+       ctrl+wheel, handled in the script below.) */
+    .monaco-workbench.web { touch-action: pinch-zoom !important; }
   </style>
 </head>
 <body aria-label="">
@@ -226,6 +233,17 @@
     setTimeout(() => { pasteNote.remove(); pasteNote = null; }, 2600);
   }
 
+  // The workbench cancels every ctrl+wheel so the browser cannot zoom the page,
+  // and a pinch on a touchpad arrives as exactly that. Nothing here wants the
+  // event, so it is kept from the workbench and the browser zooms as it would
+  // on any page. (A pinch on a touch screen goes through touch-action instead;
+  // see the stylesheet.)
+  function allowPinchZoom() {
+    window.addEventListener('wheel', (ev) => {
+      if (ev.ctrlKey) ev.stopImmediatePropagation();
+    }, { capture: true, passive: true });
+  }
+
   // The one hidden runtime iframe. It loads only the class's language engine and
   // executes the student's code, streaming output to the terminal.
   function mountRuntime(lang) {
@@ -323,6 +341,7 @@
       if (lang) mountRuntime(lang);
     }
     guardPaste();
+    allowPinchZoom();
   }
 
   (async function () {

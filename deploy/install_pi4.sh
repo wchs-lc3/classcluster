@@ -9,6 +9,16 @@ echo "== packages =="
 pacman -Sy --noconfirm --needed nginx python bubblewrap python-pytest \
     jdk-openjdk
 
+echo "== clock =="
+# The classroom network's DNS answers "pool.ntp.org" (via a local time
+# appliance) but not the "N.arch.pool.ntp.org" names systemd-timesyncd
+# defaults to, so the clock never syncs and drifts arbitrarily far behind.
+# Due-date grading (server/main.go) compares against this clock, so a wrong
+# clock means wrong late/on-time verdicts. The Pi has no RTC, so this must
+# run on every boot, not just once.
+sed -i 's/^#\?NTP=.*/NTP=pool.ntp.org/' /etc/systemd/timesyncd.conf
+systemctl restart systemd-timesyncd
+
 echo "== directories =="
 mkdir -p /opt/lc3/java/lc3runner /srv/lc3/{students,assignments,heavy}
 

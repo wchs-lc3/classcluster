@@ -8,8 +8,9 @@ and only what this process holds in memory remains.
 
 Two kinds of test live in tests/:
 
-  test_*.py    pytest-style: functions named test_*, plain assert. The
-               student's module is imported by name. A student file with code
+  test_*.py    pytest-style: functions named test_*, plain assert. Either
+  *_test.py    name pattern (pytest's own rule) marks a file as unit tests.
+               The student's module is imported by name. A student file with code
                at the top level (prints, input() calls, no main guard) still
                imports: each top-level statement runs on its own with stdin
                empty and output discarded, and a statement that fails is
@@ -29,7 +30,12 @@ Invocation:
                                   after compiling)
 
 Writes JSON to /work/.lc3-report.json:
-  {"status": "ok"|"compile_error"|"error", "tests": [{"name","passed"}]}
+  {"status": "ok"|"compile_error"|"error", "tests": [{"name","passed"}],
+   "reason": "..."}
+The reason says, in one line, why a status is not ok: tests/ held no test
+files, a test file would not import, the student's file has a syntax error.
+The gateway shows it to a teacher rehearsing an assignment, never to a
+student.
 """
 
 import ast
@@ -78,10 +84,14 @@ def collect_io_cases():
     return cases
 
 
+def is_unit_test(name):
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
 def collect_unit_tests():
     sources = {}
     for name in sorted(os.listdir(WORK)):
-        if name.startswith("test_") and name.endswith(".py"):
+        if is_unit_test(name):
             src = slurp_and_remove(os.path.join(WORK, name))
             if src is not None:
                 sources[name] = src
@@ -129,6 +139,16 @@ class _WorkFinder(importlib.abc.MetaPathFinder):
         return importlib.util.spec_from_loader(name, _LenientLoader(p), origin=p)
 
 
+def describe(exc):
+    """One line naming an exception, with the file and line for a SyntaxError."""
+    if isinstance(exc, SyntaxError) and exc.filename:
+        return "%s in %s line %s: %s" % (type(exc).__name__,
+                                          os.path.basename(exc.filename),
+                                          exc.lineno, exc.msg)
+    text = str(exc).strip().splitlines()
+    return type(exc).__name__ + (": " + text[0] if text else "")
+
+
 class _Quiet:
     """stdout/stderr to nowhere, stdin at end of file, for the duration."""
 
@@ -146,29 +166,33 @@ class _Quiet:
 # ------------------------------ unit tests --------------------------------
 
 def run_unit_tests(sources):
-    """Returns (status, results)."""
+    """Returns (status, results, reason)."""
     compiled = {}
     for name, src in sources.items():
         try:
-            compiled[name] = compile(src, "<" + name + ">", "exec")
-        except SyntaxError:
+            compiled[name] = compile(src, name, "exec")
+        except SyntaxError as e:
             # a broken private test is an author error, not a student failure
-            return "error", []
+            return "error", [], "the test file has a " + describe(e)
 
     sys.path.insert(0, WORK)
     sys.meta_path.insert(0, _WorkFinder())
 
     results = []
     status = "ok"
+    reason = ""
     for name, code in compiled.items():
         module_ns = {"__name__": "lc3_" + name[:-3]}
         try:
             with _Quiet():
                 exec(code, module_ns)
-        except Exception:
-            # importing the student module (or a test) blew up: a syntax error
-            # counts as a compile-ish failure
+        except Exception as e:
+            # Importing the student module (or the test file itself) blew up.
+            # The lenient loader swallows failing statements, so this is a
+            # syntax error in the student's file, or a test that imports a
+            # module nobody wrote.
             status = "compile_error"
+            reason = reason or (name + " could not be imported: " + describe(e))
             continue
         for attr in sorted(module_ns):
             if not attr.startswith("test_"):
@@ -183,7 +207,10 @@ def run_unit_tests(sources):
             except Exception:
                 passed = False
             results.append({"name": name[:-3] + "." + attr, "passed": passed})
-    return status, results
+    if not results and status == "ok":
+        status = "error"
+        reason = ", ".join(sorted(compiled)) + " defines no test_* functions"
+    return status, results, reason
 
 
 # ---------------------------- input/output cases --------------------------
@@ -220,7 +247,7 @@ def python_entry():
     if os.path.isfile(os.path.join(WORK, "main.py")):
         return "main.py"
     files = sorted(n for n in os.listdir(WORK)
-                   if n.endswith(".py") and not n.startswith(".") and not n.startswith("test_"))
+                   if n.endswith(".py") and not n.startswith(".") and not is_unit_test(n))
     return files[0] if files else "main.py"
 
 
@@ -238,19 +265,19 @@ def main(argv):
     cases = collect_io_cases()
     sources = collect_unit_tests()
     if not sources and not cases:
-        write({"status": "error", "tests": []})
+        write({"status": "error", "tests": [],
+               "reason": "tests/ has no test files: unit tests are test_*.py "
+                         "or *_test.py, input/output cases are <case>.out"})
         return
 
     # The cases run the program whole, before the tests import it: an import
     # that fails must not stop the cases from being tried.
     results = run_io_cases([sys.executable, os.path.join(WORK, python_entry())], cases)
-    status = "ok"
+    status, reason = "ok", ""
     if sources:
-        status, unit = run_unit_tests(sources)
+        status, unit, reason = run_unit_tests(sources)
         results = unit + results
-    if not results and status == "ok":
-        status = "compile_error"
-    write({"status": status, "tests": results})
+    write({"status": status, "tests": results, "reason": reason})
 
 
 def write(obj):
@@ -265,6 +292,7 @@ if __name__ == "__main__":
         try:
             with open(REPORT, "w") as f:
                 json.dump({"status": "error", "tests": [],
-                           "trace": traceback.format_exc()[-500:]}, f)
+                           "reason": "the grading harness failed: " +
+                                     traceback.format_exc().strip().splitlines()[-1]}, f)
         except OSError:
             pass

@@ -98,7 +98,9 @@ retires the old one immediately.
   unpublished work stays readable.
 - Authoring on the device: the teacher can run both Python and Java, write an
   assignment's `starter/` and `tests/` in their own files, and turn that folder
-  into an assignment without any external zip tool (or upload a zip). A new
+  into an assignment without any external zip tool (or upload a zip). The
+  folder can sit anywhere in the teacher's files, a unit folder holding
+  several assignments included; the assignment is named after it. A new
   assignment is unpublished until the teacher presses Publish. Creating it
   again from the same folder, or uploading the same id again, replaces the
   tests and the starter while students keep the work they have, so tests can
@@ -116,8 +118,10 @@ retires the old one immediately.
   the tests through the same grading path a student's submission takes, on the
   same workers, so what they see is what the class will see. With a file from
   `solution/` open, Submit grades the worked answer instead, which is how to
-  check that the tests can be passed. A teacher's run is not recorded as a
-  submission.
+  check that the tests can be passed. When grading could not run at all, the
+  teacher is told why in one line: no test files in `tests/`, a test that
+  would not import, a syntax error. Students get pass and fail per test and
+  nothing else. A teacher's run is not recorded as a submission.
 - Cluster distribution: grading and interactive runs go to the Pi 3 workers
   first; the gateway's own runner is used last. Adding a Pi 3 from the admin
   view provisions it over SSH and expands the pool; a Pi flashed with the

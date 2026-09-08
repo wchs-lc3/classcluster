@@ -6,8 +6,11 @@ set -euo pipefail
 PYODIDE_VERSION=0.28.3
 
 echo "== packages =="
+# Offline (a school network that blocks the mirrors) is not a reason to leave
+# the old binary running: what is installed already stays, and the rest of
+# the install goes on.
 pacman -Sy --noconfirm --needed nginx python bubblewrap python-pytest \
-    jdk-openjdk
+    jdk-openjdk || echo "package install failed (offline?); continuing with what is installed"
 
 echo "== clock =="
 # The classroom network's DNS answers "pool.ntp.org" (via a local time
@@ -59,5 +62,23 @@ systemctl daemon-reload
 systemctl enable --now lc3-runner lc3-api nginx
 systemctl restart lc3-runner lc3-api nginx
 
-echo "== done =="
+echo "== services =="
 systemctl --no-pager --plain status lc3-api lc3-runner nginx | grep -E 'lc3|nginx|Active'
+
+# Every URL the editor loads on the way in. A 404 on any of these is a blank
+# editor or an editor without Run and Submit, so the install is not done
+# until all of them answer.
+echo "== check =="
+sleep 2
+bad=0
+for u in / /api/health /ide/out/vs/loader.js /runtime/livescript.js \
+         /ide-ext/lc3/package.json /ide-ext/lc3/extension.js /ide-ext/lc3/extension.ls; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1$u")
+    printf '  %-32s %s\n' "$u" "$code"
+    [ "$code" = 200 ] || bad=1
+done
+if [ $bad -ne 0 ]; then
+    echo "a page the editor needs is not served (see above); check nginx -t and journalctl -u lc3-api" >&2
+    exit 1
+fi
+echo "== done =="

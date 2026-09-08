@@ -343,6 +343,65 @@ has "$mk" '"closed":true' "a closed assignment stays closed through an update"
 tpost /api/admin/assignments/delete '{"id":"mkasg"}' >/dev/null
 echo "$(curl -s -b $J $BASE/api/assignments)" | grep -q mkasg && bad "deleted assignment still visible" || ok "delete assignment removes it"
 
+echo "== teacher: an assignment folder inside a unit folder, and why grading could not run =="
+# The authoring folder can sit anywhere in the teacher's files. Submit sends
+# its path; Create from folder names the assignment after it.
+for d in starter tests solution; do curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/unit1/nested/$d" >/dev/null; done
+curl -s -b $JT -X POST --data-binary 'def add(a,b): return 0' "$BASE/api/fs/write?path=/unit1/nested/starter/main.py" >/dev/null
+curl -s -b $JT -X POST --data-binary 'def add(a,b): return a+b' "$BASE/api/fs/write?path=/unit1/nested/solution/main.py" >/dev/null
+curl -s -b $JT -X POST --data-binary 'import main
+def test_add(): assert main.add(2,3)==5' "$BASE/api/fs/write?path=/unit1/nested/tests/main_test.py" >/dev/null
+res=$(tpost /api/submit '{"assignment":"","part":"starter","folder":"/unit1/nested"}')
+has "$res" '"graded":"starter"' "a teacher's Submit finds the starter through the folder"
+has "$res" 'main_test.test_add' "a test file named *_test.py counts, as in pytest"
+has "$res" '"failed":1' "the unfinished starter fails"
+res=$(tpost /api/submit '{"assignment":"nested","part":"solution","folder":"/unit1/nested"}')
+has "$res" '"graded":"solution"' "and the solution through the same folder"
+has "$res" '"failed":0' "which passes"
+res=$(tpost /api/submit '{"assignment":"nested","folder":"/../../etc"}')
+has "$res" 'bad folder' "a folder outside the teacher's files is refused"
+mk=$(tpost /api/admin/assignments/from-folder '{"folder":"/unit1/nested","classes":["cp3"]}')
+has "$mk" '"id":"nested"' "created from a nested folder, the assignment is named after the folder"
+tpost /api/admin/assignments/publish '{"id":"nested"}' >/dev/null
+has "$(curl -s -b $J $BASE/api/assignments)" 'nested' "and reaches the student under that name"
+curl -s -b $J -X POST --data-binary 'def add(a,b): return a+b' "$BASE/api/fs/write?path=/nested/main.py" >/dev/null
+res=$(curl -s -b $J -X POST -H 'Content-Type: application/json' -d '{"assignment":"nested"}' $BASE/api/submit)
+has "$res" '"failed":0' "the student's submission grades against the nested folder's tests"
+# A student's syntax error is a compile error with no explanation attached.
+curl -s -b $J -X POST --data-binary 'def add(a,b) return a+b' "$BASE/api/fs/write?path=/nested/main.py" >/dev/null
+res=$(curl -s -b $J -X POST -H 'Content-Type: application/json' -d '{"assignment":"nested"}' $BASE/api/submit)
+has "$res" '"status":"compile_error"' "a student's syntax error is a compile error"
+has "$res" '"reason":""' "and the student is told nothing more"
+# The teacher is told why. A tests/ folder without test files is the mistake
+# an unfamiliar naming rule produces, so its reason names the rule.
+curl -s -b $JT -X POST --data-binary 'def add(a,b) return a+b' "$BASE/api/fs/write?path=/unit1/nested/starter/main.py" >/dev/null
+res=$(tpost /api/submit '{"assignment":"nested","folder":"/unit1/nested"}')
+has "$res" 'SyntaxError in main.py line 1' "the teacher's rehearsal names the syntax error and its line"
+curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/unit1/bare/starter" >/dev/null
+curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/unit1/bare/tests" >/dev/null
+curl -s -b $JT -X POST --data-binary 'print(1)' "$BASE/api/fs/write?path=/unit1/bare/starter/main.py" >/dev/null
+curl -s -b $JT -X POST --data-binary 'def test_x(): pass' "$BASE/api/fs/write?path=/unit1/bare/tests/checks.py" >/dev/null
+res=$(tpost /api/submit '{"folder":"/unit1/bare"}')
+has "$res" '"status":"error"' "a tests/ folder with no recognisable test file cannot grade"
+has "$res" 'test_\*.py or \*_test.py' "and the reason spells out the file names that count"
+curl -s -b $JT -X POST --data-binary 'import mian' "$BASE/api/fs/write?path=/unit1/bare/tests/test_x.py" >/dev/null
+res=$(tpost /api/submit '{"folder":"/unit1/bare"}')
+has "$res" "No module named 'mian'" "a test that imports a module nobody wrote says so"
+# Each input/output case is a run of its own, so the time limit is per run:
+# two cases that each take most of it must both pass.
+curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/unit1/slow/starter" >/dev/null
+curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/unit1/slow/tests" >/dev/null
+curl -s -b $JT -X POST --data-binary 'import time
+time.sleep(2)
+print("x")' "$BASE/api/fs/write?path=/unit1/slow/starter/main.py" >/dev/null
+curl -s -b $JT -X POST --data-binary 'x' "$BASE/api/fs/write?path=/unit1/slow/tests/one.out" >/dev/null
+curl -s -b $JT -X POST --data-binary 'x' "$BASE/api/fs/write?path=/unit1/slow/tests/two.out" >/dev/null
+curl -s -b $JT -X POST --data-binary 'timeout_sec: 3' "$BASE/api/fs/write?path=/unit1/slow/assignment.yaml" >/dev/null
+res=$(tpost /api/submit '{"folder":"/unit1/slow"}')
+has "$res" '"passed":2' "two cases that each take most of the time limit both pass"
+tpost /api/admin/assignments/delete '{"id":"nested"}' >/dev/null
+curl -s -b $JT -X POST "$BASE/api/fs/delete?path=/unit1" >/dev/null
+
 echo "== grading: input/output cases, and a script with no main guard =="
 curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/ioasg/starter" >/dev/null
 curl -s -b $JT -X POST "$BASE/api/fs/mkdir?path=/ioasg/tests" >/dev/null

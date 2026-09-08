@@ -340,11 +340,25 @@ active-lc3-file = ->
   return null if not ed or ed.document.uri.scheme isnt 'lc3'
   ed.document.uri.path
 
-# The assignment a path belongs to is its first folder: /hello-py/main.py.
-assignment-of = (path) ->
-  return '' unless path
+# Where an assignment's files are. A student's copy is a top-level folder
+# named after it: /hello-py/main.py. A teacher's authoring folder holds
+# starter/, tests/ and solution/ and can sit anywhere: /unit1/hello-py/starter/
+# main.py belongs to hello-py, whose folder is /unit1/hello-py. A teacher's file
+# with none of those around it is taken to sit directly in the folder.
+author-parts = <[ starter tests solution ]>
+assignment-folder-of = (path) ->
+  return [] unless path
   parts = path.split '/' .filter (-> it)
-  parts[0] or ''
+  return [] unless parts.length
+  if me?.role is 'teacher'
+    for p, i in parts when i > 0 and p in author-parts
+      return parts.slice 0, i
+    return parts.slice 0, parts.length - 1 if parts.length > 1
+  [parts[0]]
+
+assignment-of = (path) ->
+  parts = assignment-folder-of path
+  parts[parts.length - 1] or ''
 
 due-text = (unix) ->
   return '' unless unix
@@ -497,6 +511,9 @@ show-submit-result = (assignment, r) ->
   for t in r.tests
     pty.raw (if t.passed then '\x1b[32m  PASS  \x1b[0m' else '\x1b[31m  FAIL  \x1b[0m') + t.name + '\r\n'
   pty.dim 'result: ' + r.passed + ' passed, ' + r.failed + ' failed  (status: ' + r.status + ')'
+  # Why a status is not ok, for the teacher's rehearsal: a student is told
+  # pass/fail and nothing about the tests.
+  pty.dim r.reason if r.reason
   # A late submission still counts and still reaches the teacher; saying so here
   # is the only place the student learns the deadline has passed.
   if r.late
@@ -504,10 +521,14 @@ show-submit-result = (assignment, r) ->
     vscode.window.showWarningMessage assignment + ': submitted after the due date (' +
       due-text(r.due) + '). Your teacher can see that it was late.'
   whose = if r.dry_run then 'the ' + r.graded else 'your code'
+  why = if r.reason then ' ' + r.reason else ''
   if r.status is 'compile_error'
-    vscode.window.showErrorMessage assignment + ': ' + whose + ' does not compile. Use Run to see details.'
+    vscode.window.showErrorMessage assignment + ': ' + whose + ' does not compile.' +
+      (if r.reason then why else ' Use Run to see details.')
   else if r.status is 'timeout'
-    vscode.window.showErrorMessage assignment + ': ' + whose + ' ran too long (infinite loop?).'
+    vscode.window.showErrorMessage assignment + ': ' + whose + ' ran too long (infinite loop?).' + why
+  else if r.status is 'error'
+    vscode.window.showErrorMessage assignment + ': grading could not run.' + why
   else if r.failed is 0 and r.passed > 0
     vscode.window.showInformationMessage assignment + ': all ' + r.passed + ' tests passed!'
   else
@@ -517,7 +538,8 @@ show-submit-result = (assignment, r) ->
 # under solution/ grades the worked answer, anything else the starter.
 part-of = (path) ->
   parts = path.split '/' .filter (-> it)
-  if me.role is 'teacher' and parts[1] is 'solution' then 'solution' else 'starter'
+  n = assignment-folder-of(path).length
+  if me.role is 'teacher' and parts[n] is 'solution' then 'solution' else 'starter'
 
 submit-command = ->
   path = active-lc3-file!
@@ -529,6 +551,9 @@ submit-command = ->
     vscode.window.showWarningMessage 'Put your work in an assignment folder before submitting.'
     return
   part = part-of path
+  # A teacher's authoring folder can be anywhere in their files; the gateway
+  # needs its path, not only the assignment's name.
+  folder = if me.role is 'teacher' then '/' + assignment-folder-of(path).join('/') else ''
   vscode.workspace.saveAll false
     .then ->
       if me.role is 'teacher'
@@ -546,7 +571,7 @@ submit-command = ->
         ->
           # For a teacher this is the same grading path a student's submission
           # takes, over the starter they publish; it just is not recorded.
-          req 'POST', '/api/submit', {assignment: assignment, part: part}
+          req 'POST', '/api/submit', {assignment: assignment, part: part, folder: folder}
             .then ((resp) ->
               if not resp.ok
                 return resp.json!.then ((j) ->
@@ -1206,9 +1231,10 @@ register-admin = (context) ->
     vscode.commands.registerCommand 'lc3.createAssignment', guarded ->
       classes <- pick-classes 'Class(es) for this assignment (space to select more)' .then
       return unless classes
+      # The folder holding starter/ and tests/, whatever file of it is open.
       active = vscode.window.activeTextEditor
       def = if active and active.document.uri.scheme is 'lc3'
-        then active.document.uri.path.replace /\/[^/]*$/, ''
+        then active.document.uri.path.replace(/\/[^/]*$/, '').replace /\/(starter|tests|solution)(\/.*)?$/, ''
         else ''
       folder <- vscode.window.showInputBox {
         prompt: 'Folder in your files containing starter/ and tests/', value: def} .then

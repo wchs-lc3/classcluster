@@ -148,8 +148,8 @@ green before you change anything.
 - tests/    the private tests the grader runs. Students never receive these,
   and the grader deletes them inside the sandbox before student code runs, so
   expected answers are safe here. Two kinds live side by side:
-    - unit tests (test_*.py with test_* functions, or a JUnit class whose
-      name contains Test) call the student's functions;
+    - unit tests (test_*.py or *_test.py with test_* functions, or a JUnit
+      class whose name contains Test) call the student's functions;
     - input/output cases (<case>.out, with an optional <case>.in) run the
       whole program with that input and compare everything it prints, line
       for line, with the .out file. Prompts count as output. These need no
@@ -172,8 +172,10 @@ green before you change anything.
 ## Publish it
 
 Class Management -> Assignments -> Create from folder, and give this folder.
-The assignment is created unpublished; press Publish when the class should
-see it. To change the tests later, edit tests/ and run Create from folder
+It can sit anywhere in your files, inside a unit folder with other assignments
+included, and the assignment is named after it unless you give an id. The
+assignment is created unpublished; press Publish when the class should see
+it. To change the tests later, edit tests/ and run Create from folder
 again: the new tests take effect at the next Submit, students keep the work
 they have, and any starter file they do not have yet is handed to them.
 `

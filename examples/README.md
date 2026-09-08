@@ -11,7 +11,7 @@ Zip layout, if you make your own:
     assignment.yaml   settings (optional; see below)
     starter/...       files the student receives
     tests/...         private tests, of either or both kinds:
-                        test_*.py, or *Test.java with JUnit  (unit tests)
+                        test_*.py or *_test.py, or *Test.java with JUnit  (unit tests)
                         <case>.out with an optional <case>.in (input/output)
 
 An input/output case runs the student's program whole, feeding it `<case>.in`
@@ -34,6 +34,10 @@ optional:
     due: 2026-09-14 23:59    # or a plain date for the end of that day
     no_paste: false          # true stops pasting from outside the editor
     entry: main.py           # the file the input/output cases run
+
+The same layout as a folder in the teacher's own files, anywhere in them (a
+unit folder holding several assignments is fine), becomes an assignment with
+Create from folder; it is named after the folder unless an id is given.
 
 An uploaded assignment starts unpublished; press Publish when the class should
 see it. Uploading a zip with the same id again replaces the tests and the

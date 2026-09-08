@@ -50,7 +50,7 @@ if $SSH $PI '[ ! -f /opt/lc3/web/ide/out/vs/loader.js ]' || [ "${1:-}" = "--vsco
         [ \$keep -eq 0 ] && rm -rf \"\$d\"; done; echo trimmed to: \$(ls)"
 fi
 
-# LC3 web extension (extension.js + admin.html) served at /ide-ext/lc3/.
+# LC3 web extension (package.json, extension.js, extension.ls) served at /ide-ext/lc3/.
 $SSH $PI 'mkdir -p /opt/lc3/web/ext && cp -r /opt/lc3/ext/lc3 /opt/lc3/web/ext/'
 
 # install_pi4.sh needs root (pacman, systemctl, /etc/nginx, /etc/systemd).

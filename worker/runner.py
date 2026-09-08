@@ -68,6 +68,10 @@ JAVA_LIBS = env_str("LC3_JAVA_LIBS", "/opt/lc3/java")
 BIND = env_str("LC3_RUNNER_BIND", "0.0.0.0")
 PORT = env_int("LC3_RUNNER_PORT", 9500)
 MAX_TIMEOUT = env_int("LC3_MAX_TIMEOUT", 90)
+# Ceiling on one grading run as a whole: the per-run timeout times the number
+# of program runs the tests need (see grade_wall), but never past this. The
+# gateway waits 150 seconds for a grader and nginx 200 for the gateway.
+GRADE_WALL_MAX = env_int("LC3_GRADE_WALL_MAX", 120)
 
 PYTHON_BIN = env_str("LC3_PYTHON", "python")
 SANDBOX_PATH = env_str("LC3_SANDBOX_PATH", "/usr/bin:/usr/lib/jvm/default/bin")
@@ -219,7 +223,8 @@ def run_sandboxed(job_dir, mem_mb, timeout_sec, inner, vmem_limit=False):
 
 
 def read_report(job_dir):
-    """The harness's JSON report, or None when it never wrote one."""
+    """The harness's JSON report, or None when it never wrote one. Its reason
+    is a one-line explanation of a status that is not ok, for the teacher."""
     report = os.path.join(job_dir, ".lc3-report.json")
     if not os.path.isfile(report):
         return None
@@ -233,6 +238,14 @@ def read_report(job_dir):
     return result
 
 
+def grade_wall(job_dir, timeout_sec):
+    """How long the whole grading run may take. The timeout is per program
+    run: every input/output case runs the program once more, and the unit
+    tests share one run, so the sandbox gets that many."""
+    cases = sum(1 for n in os.listdir(job_dir) if n.endswith(".out"))
+    return min(GRADE_WALL_MAX, timeout_sec * (1 + cases))
+
+
 def grade_python(job_dir, timeout_sec, mem_mb, entry):
     # The harness runs as the sandbox entry point: it reads the private tests
     # into memory and deletes their source before importing student code, so
@@ -240,13 +253,16 @@ def grade_python(job_dir, timeout_sec, mem_mb, entry):
     shutil.copyfile(PYHARNESS, os.path.join(job_dir, ".lc3_harness.py"))
     inner = ("LC3_TIMEOUT=" + str(timeout_sec) + " LC3_ENTRY=" + shlex.quote(entry or "") +
              " " + PYTHON_BIN + " /work/.lc3_harness.py")
-    rc = run_sandboxed(job_dir, mem_mb, timeout_sec, inner, vmem_limit=True)
+    rc = run_sandboxed(job_dir, mem_mb, grade_wall(job_dir, timeout_sec), inner, vmem_limit=True)
     result = read_report(job_dir)
     if rc in (124, 137):
-        return {"status": "timeout", "tests": result["tests"] if result else []}
+        return {"status": "timeout", "tests": result["tests"] if result else [],
+                "reason": "grading ran past " + str(timeout_sec) + " seconds"}
     if result is None:
-        return {"status": "error", "tests": []}
-    return {"status": result.get("status", "error"), "tests": result["tests"]}
+        return {"status": "error", "tests": [],
+                "reason": "the grading harness wrote no report (exit " + str(rc) + ")"}
+    return {"status": result.get("status", "error"), "tests": result["tests"],
+            "reason": str(result.get("reason", "") or "")}
 
 
 def grade_java(job_dir, timeout_sec, mem_mb, entry):
@@ -280,14 +296,17 @@ def grade_java(job_dir, timeout_sec, mem_mb, entry):
         "$(cd /work/.classes && ls *Test*.class 2>/dev/null | sed 's/\\.class$//' | grep -v '\\$') "
         ">/work/.lc3-results.txt 2>/work/.lc3-stderr.txt"
     )
-    rc = run_sandboxed(job_dir, mem_mb, timeout_sec, inner)
+    wall = grade_wall(job_dir, timeout_sec)
+    rc = run_sandboxed(job_dir, mem_mb, wall, inner)
     if not os.path.isfile(os.path.join(job_dir, ".lc3-compiled")):
-        return {"status": "compile_error", "tests": []}
+        return {"status": "compile_error", "tests": [],
+                "reason": first_line(os.path.join(job_dir, ".lc3-compile.txt"))}
     results = os.path.join(job_dir, ".lc3-results.txt")
     io_result = read_report(job_dir)
     tests = io_result["tests"] if io_result else []
     if rc in (124, 137) and not os.path.isfile(results):
-        return {"status": "timeout", "tests": tests}
+        return {"status": "timeout", "tests": tests,
+                "reason": "grading ran past " + str(timeout_sec) + " seconds"}
     try:
         with open(results, "r", errors="replace") as f:
             for line in f:
@@ -298,10 +317,24 @@ def grade_java(job_dir, timeout_sec, mem_mb, entry):
     except OSError:
         pass
     if rc in (124, 137):
-        return {"status": "timeout", "tests": tests}
+        return {"status": "timeout", "tests": tests,
+                "reason": "grading ran past " + str(timeout_sec) + " seconds"}
     if not tests:
-        return {"status": "error", "tests": []}
-    return {"status": "ok", "tests": tests}
+        return {"status": "error", "tests": [],
+                "reason": "tests/ has no tests: JUnit classes are named *Test*.java, "
+                          "input/output cases are <case>.out"}
+    return {"status": "ok", "tests": tests, "reason": ""}
+
+
+def first_line(path):
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                if line.strip():
+                    return line.strip()[:200]
+    except OSError:
+        pass
+    return ""
 
 
 WRAPPER_SRC = """\

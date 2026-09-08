@@ -564,6 +564,10 @@ type gradeResult struct {
 		Name   string `json:"name"`
 		Passed bool   `json:"passed"`
 	} `json:"tests"`
+	// Reason is one line on why the status is not ok (no test files, a test
+	// that would not import, a syntax error). It is for the teacher's
+	// rehearsal only; a student gets pass/fail and nothing else.
+	Reason string `json:"reason"`
 }
 
 func handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -572,21 +576,37 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Part is the teacher's choice of what to grade: "solution" runs their
-	// worked answer against the tests, anything else the starter. Students
-	// have one folder and no choice.
-	var body struct{ Assignment, Part string }
+	// worked answer against the tests, anything else the starter. Folder is
+	// where the teacher's authoring copy lives when it is not a top-level
+	// folder named after the assignment (a unit folder holding several, say).
+	// Students have one folder and no choice.
+	var body struct{ Assignment, Part, Folder string }
 	if err := readBody(r, &body); err != nil {
 		fail(w, 400, "bad json")
 		return
+	}
+	dryRun := u.Role == "teacher"
+	own := ""
+	if dryRun && strings.Trim(body.Folder, "/ ") != "" {
+		p, err := safePath(studentRoot(u), body.Folder)
+		if err != nil || !isDir(p) {
+			fail(w, 400, "bad folder")
+			return
+		}
+		own = p
+		if strings.TrimSpace(body.Assignment) == "" {
+			body.Assignment = filepath.Base(p)
+		}
 	}
 	aid := strings.Trim(body.Assignment, "/ ")
 	if !validID(aid) {
 		fail(w, 400, "bad assignment id")
 		return
 	}
-	dryRun := u.Role == "teacher"
 	m := loadManifest(aid)
-	own := filepath.Join(studentRoot(u), aid)
+	if own == "" {
+		own = filepath.Join(studentRoot(u), aid)
+	}
 	if m == nil && dryRun {
 		// An assignment the teacher is still writing has no published manifest
 		// yet. Its own folder describes it well enough to rehearse against, so
@@ -679,10 +699,14 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 			Late: late, Tests: tests,
 		})
 	}
+	reason := ""
+	if dryRun {
+		reason = result.Reason
+	}
 	writeJSON(w, 200, map[string]any{
 		"id": id, "status": result.Status, "passed": passed,
 		"failed": len(tests) - passed, "tests": tests, "dry_run": dryRun,
-		"graded": graded, "due": m.Due, "late": late && !dryRun})
+		"graded": graded, "due": m.Due, "late": late && !dryRun, "reason": reason})
 }
 
 func handleCompileJava(w http.ResponseWriter, r *http.Request) {
